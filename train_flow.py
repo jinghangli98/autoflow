@@ -226,7 +226,7 @@ def parse_args():
     parser.add_argument("--resize_size", type=int, default=512,
                         help="Size to resize images to")
     parser.add_argument("--data_path", type=str, 
-                        default='/ix3/tibrahim/jil202/cfg_gen/qc_image_tif/mprage_2_tse/tse/coronal/',
+                        default='/ix3/tibrahim/jil202/cfg_gen/qc_image_png/mprage_2_mp2rage_denoised/target/*/',
                         help="Path to the dataset directory")
     parser.add_argument("--save_model", action="store_true",
                         help="Flag to save model checkpoints")
