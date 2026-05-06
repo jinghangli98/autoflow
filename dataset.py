@@ -1,241 +1,241 @@
-import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import transforms, datasets
-import os
-from PIL import Image
+"""3D NIfTI patch dataset for autoregressive flow matching.
+
+Pairs undersampled patches (GRAPPA `_R{3..6}` / CS `_CS_R{2,3}`) with their
+matching ground-truth patches inside a single contrast (mprage or tse).
+
+Layout assumed:
+  <data_root>/<split>/<contrast>/<subject>/patch_<x>_<y>_<z>.nii.gz
+where <subject> is the GT id (no suffix) and siblings <subject>_R3, ..., _CS_R3
+contain the same patch coordinates with the corresponding undersampling.
+"""
+
 import glob
-import numpy as np
-import torchio as tio
-import matplotlib.pyplot as plt
+import os
 import random
-from pathlib import Path
-from natsort import natsorted
-from torch.utils.data.distributed import DistributedSampler
 import re
-import torch.nn.functional as F
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 
-class CenterCrop3D:
-    """Center crop for 3D volumes (crops H and W only, keeps all slices)"""
-    def __init__(self, crop_h, crop_w):
-        self.crop_h = crop_h
-        self.crop_w = crop_w
-
-    def __call__(self, img):
-        """
-        Args:
-            img: tensor of shape (D, H, W) or (C, D, H, W)
-        """
-        h, w = img.shape[-2], img.shape[-1]
-        new_h, new_w = self.crop_h, self.crop_w
-
-        # Center crop offsets (0 if image smaller than crop)
-        top = max(0, (h - new_h) // 2)
-        left = max(0, (w - new_w) // 2)
-
-        if img.ndim == 3:
-            cropped = img[:, top:top+new_h, left:left+new_w]
-        else:
-            cropped = img[:, :, top:top+new_h, left:left+new_w]
-
-        # Center pad if image was smaller than crop size
-        pad_h = new_h - cropped.shape[-2]
-        pad_w = new_w - cropped.shape[-1]
-        if pad_h > 0 or pad_w > 0:
-            pad_top = pad_h // 2
-            pad_bottom = pad_h - pad_top
-            pad_left = pad_w // 2
-            pad_right = pad_w - pad_left
-            # F.pad order: (left, right, top, bottom)
-            cropped = F.pad(cropped, (pad_left, pad_right, pad_top, pad_bottom))
-
-        return cropped
+_PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
+_UNDERSAMPLED_SUFFIX_RE = re.compile(r"_(?:CS_)?R\d+$")
 
 
-class tseDataset(Dataset):
-    def __init__(self, image_groups, num_slices=5, crop_size=448, artifact_transform=None):
-        self.image_groups = image_groups
-        self.num_slices = num_slices
-        self.crop = CenterCrop3D(crop_size, crop_size)
-        self.artifact_transform = artifact_transform
-        self.context_radius = num_slices // 2
+def _is_gt_subject(name: str) -> bool:
+    """Return True if a subject directory name has no `_R*`/`_CS_R*` suffix."""
+    return _UNDERSAMPLED_SUFFIX_RE.search(name) is None
+
+
+def _find_undersampled_siblings(contrast_dir: str, gt_name: str):
+    """Find sibling undersampled subject dirs for a given GT subject name.
+
+    A sibling matches `<gt_name>_R<digit>+` or `<gt_name>_CS_R<digit>+` exactly.
+    """
+    candidates = sorted(
+        d for d in os.listdir(contrast_dir)
+        if os.path.isdir(os.path.join(contrast_dir, d))
+    )
+    pattern = re.compile(rf"^{re.escape(gt_name)}_(?:CS_)?R\d+$")
+    return [c for c in candidates if pattern.match(c)]
+
+
+def _index_subject_patches(subject_dir: str):
+    """Map (x, y, z) tuple -> absolute patch path for a subject directory."""
+    out = {}
+    for f in glob.glob(os.path.join(subject_dir, "patch_*.nii.gz")):
+        m = _PATCH_RE.search(os.path.basename(f))
+        if not m:
+            continue
+        x, y, z = (int(m.group(i)) for i in (1, 2, 3))
+        out[(x, y, z)] = f
+    return out
+
+
+def _load_patch(path: str) -> torch.Tensor:
+    """Load a single 192x192x16 NIfTI patch as float32 tensor (1, 192, 192, 16)."""
+    arr = nib.load(path).get_fdata().astype(np.float32)
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+class PatchPairDataset(Dataset):
+    """One sample = (undersampled patch, GT patch, prev GT Z-patch).
+
+    Each tensor returned is shape (1, 192, 192, 16) (channel-first 3D).
+    """
+
+    def __init__(self, samples, gt_index_by_subject, patch_shape=(192, 192, 16)):
+        self.samples = samples
+        self.gt_index = gt_index_by_subject
+        self.patch_shape = patch_shape
 
     def __len__(self):
-        return len(self.image_groups)
+        return len(self.samples)
 
-    def __getitem__(self, index):
-        group_info = self.image_groups[index]
-        center_slice_idx = group_info['center_idx']
-        available_slices = group_info['available_slices']
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        condition = _load_patch(s["condition_path"])
+        target = _load_patch(s["target_path"])
 
-        # Determine which slices to load around the center slice
-        slice_indices = []
-        for offset in range(-self.context_radius, self.context_radius + 1):
-            target_idx = center_slice_idx + offset
-            if target_idx < 0:
-                target_idx = abs(target_idx)
-            elif target_idx >= len(available_slices):
-                target_idx = 2 * len(available_slices) - target_idx - 2
-                target_idx = max(0, target_idx)
-            target_idx = min(target_idx, len(available_slices) - 1)
-            slice_indices.append(target_idx)
-
-        # Load mprage slices
-        mprage_slices = []
-        for slice_idx in slice_indices:
-            slice_path = available_slices[slice_idx].replace('PLACEHOLDER', 'mprage')
-            try:
-                img = Image.open(slice_path)
-                mprage_slices.append(torch.tensor(np.array(img), dtype=torch.float32))
-            except:
-                center_path = available_slices[center_slice_idx].replace('PLACEHOLDER', 'mprage')
-                img = Image.open(center_path)
-                mprage_slices.append(torch.tensor(np.array(img), dtype=torch.float32))
-
-        # Load tse slices
-        tse_slices = []
-        for slice_idx in slice_indices:
-            slice_path = available_slices[slice_idx].replace('PLACEHOLDER', 'tse')
-            try:
-                img = Image.open(slice_path)
-                tse_slices.append(torch.tensor(np.array(img), dtype=torch.float32))
-            except:
-                center_path = available_slices[center_slice_idx].replace('PLACEHOLDER', 'tse')
-                img = Image.open(center_path)
-                tse_slices.append(torch.tensor(np.array(img), dtype=torch.float32))
-
-        # Stack slices: (num_slices, H, W)
-        mprage_volume = torch.stack(mprage_slices)
-        tse_volume = torch.stack(tse_slices)
-
-        # Center crop both to 448x448
-        mprage_volume = self.crop(mprage_volume)
-        tse_volume = self.crop(tse_volume)
-
-        # Normalize to [0, 1] BEFORE artifact transforms so that
-        # torchio's multiplicative augmentations (RandomBiasField etc.)
-        # operate in [0, 1] space and don't push values above 1.
-        mprage_volume = mprage_volume / 255.0
-        tse_volume = tse_volume / 255.0
-
-        # Apply artifact transforms only to mprage (in [0,1] space)
-        if self.artifact_transform:
-            mprage_volume = self.artifact_transform(mprage_volume.unsqueeze(0)).squeeze()
-            mprage_volume = mprage_volume.clamp(0.0, 1.0)  # guarantee [0, 1] after augmentation
-
-        return mprage_volume, tse_volume
-
-
-def group_slices_by_volume(all_files):
-    volume_groups = {}
-
-    for file_path in all_files:
-        filename = Path(file_path).stem
-        match = re.search(r'slice(\d+)$', filename)
-        if match:
-            slice_num = int(match.group(1))
-            volume_name = filename[:match.start()]
+        prev_key = (s["x"], s["y"], s["z"] - 1)
+        prev_path = self.gt_index[s["gt_subject"]].get(prev_key)
+        if s["z"] > 0 and prev_path is not None:
+            prev_chunk = _load_patch(prev_path)
         else:
+            prev_chunk = torch.zeros((1, *self.patch_shape), dtype=torch.float32)
+
+        return condition, target, prev_chunk
+
+
+def build_samples(data_root: str, split: str, contrast: str):
+    """Enumerate (undersampled, GT) patch pairs for one split + contrast.
+
+    Returns:
+        samples: list of dicts (see PatchPairDataset.__init__).
+        gt_index: dict gt_subject -> {(x,y,z): gt_path}.
+    """
+    contrast_dir = os.path.join(data_root, split, contrast)
+    if not os.path.isdir(contrast_dir):
+        raise FileNotFoundError(f"Contrast directory not found: {contrast_dir}")
+
+    all_subjects = sorted(
+        d for d in os.listdir(contrast_dir)
+        if os.path.isdir(os.path.join(contrast_dir, d))
+    )
+    gt_subjects = [s for s in all_subjects if _is_gt_subject(s)]
+
+    samples = []
+    gt_index = {}
+    for gt in gt_subjects:
+        gt_dir = os.path.join(contrast_dir, gt)
+        gt_patches = _index_subject_patches(gt_dir)
+        if not gt_patches:
             continue
+        gt_index[gt] = gt_patches
 
-        volume_key = file_path.replace('/mprage/', '/PLACEHOLDER/').replace('/tse/', '/PLACEHOLDER/')
-        volume_key = str(Path(volume_key).parent / volume_name)
+        siblings = _find_undersampled_siblings(contrast_dir, gt)
+        for sib in siblings:
+            sib_dir = os.path.join(contrast_dir, sib)
+            sib_patches = _index_subject_patches(sib_dir)
+            for (x, y, z), us_path in sib_patches.items():
+                if (x, y, z) not in gt_patches:
+                    continue
+                samples.append({
+                    "condition_path": us_path,
+                    "target_path": gt_patches[(x, y, z)],
+                    "gt_subject": gt,
+                    "x": x, "y": y, "z": z,
+                })
 
-        if volume_key not in volume_groups:
-            volume_groups[volume_key] = []
-
-        placeholder_path = file_path.replace('/mprage/', '/PLACEHOLDER/').replace('/tse/', '/PLACEHOLDER/')
-        volume_groups[volume_key].append((slice_num, placeholder_path))
-
-    image_groups = []
-    for volume_key, slices in volume_groups.items():
-        slices.sort(key=lambda x: x[0])
-        slice_paths = [x[1] for x in slices]
-
-        for i in range(len(slice_paths)):
-            image_groups.append({
-                'center_idx': i,
-                'available_slices': slice_paths,
-                'base_path': volume_key,
-                'volume_name': Path(volume_key).name
-            })
-
-    return image_groups
+    return samples, gt_index
 
 
-def get_dataset_3d(data_root, crop_size=448, num_slices=5, sample=1, split_ratio=0.95):
-    random_effects = {
-        tio.transforms.RandomBiasField(0.3, 3): 0.1,
-        tio.transforms.RandomGhosting(intensity=(0.1, 0.5)): 0.1,
-    }
+def _subsample(samples, percent: float, seed: int = 42):
+    """Return a deterministic random subset of `samples` (percent in [0, 100])."""
+    if percent >= 100:
+        return samples
+    rng = random.Random(seed)
+    n = max(1, int(len(samples) * percent / 100.0))
+    return rng.sample(samples, n)
 
-    all_files = natsorted(glob.glob(f'{data_root}/*.tif'))
-    image_groups = group_slices_by_volume(all_files)
 
-    sample_size = max(1, int(len(image_groups) * sample / 100))
-    random.seed(42)
-    sampled_groups = random.sample(image_groups, sample_size)
-    random.seed(None)
+def get_dataset_3d_patches(data_root: str, contrast: str, sample: float = 100.0):
+    """Build train + val datasets for one contrast.
 
-    dataset = tseDataset(
-        image_groups=sampled_groups,
-        num_slices=num_slices,
-        crop_size=crop_size,
-        artifact_transform=tio.OneOf(random_effects)
-    )
+    Train comes from `train/`, validation from `test/`.
+    """
+    train_samples, train_index = build_samples(data_root, "train", contrast)
+    val_samples, val_index = build_samples(data_root, "test", contrast)
 
-    generator = torch.Generator().manual_seed(42)
-    train_set, val_set = torch.utils.data.random_split(
-        dataset,
-        [int(len(dataset) * split_ratio), len(dataset) - int(len(dataset) * split_ratio)],
-        generator=generator
-    )
+    train_samples = _subsample(train_samples, sample, seed=42)
+    val_samples = _subsample(val_samples, min(sample, 5.0), seed=43)
 
+    train_set = PatchPairDataset(train_samples, train_index)
+    val_set = PatchPairDataset(val_samples, val_index)
     return train_set, val_set
 
 
-def getloader_3d(batch_size, data_root, crop_size=448, num_slices=5, sample=1, num_workers=4,
-                 distributed=False, rank=0, world_size=1, split_ratio=0.99, train_shuffle=True):
-    train_set, val_set = get_dataset_3d(data_root, crop_size, num_slices, sample, split_ratio)
+def getloader_3d_patches(
+    batch_size: int,
+    data_root: str,
+    contrast: str,
+    sample: float = 100.0,
+    num_workers: int = 4,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    train_shuffle: bool = True,
+):
+    """DataLoaders for 3D NIfTI patch reconstruction. DDP-aware."""
+    train_set, val_set = get_dataset_3d_patches(data_root, contrast, sample)
 
     if distributed:
-        train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=train_shuffle, seed=42)
-        val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False, seed=42)
-
-        train_loader = DataLoader(train_set, batch_size=batch_size, sampler=train_sampler,
-                                  num_workers=num_workers, pin_memory=True, drop_last=True)
-        val_loader = DataLoader(val_set, batch_size=batch_size, sampler=val_sampler,
-                                num_workers=num_workers, pin_memory=True, drop_last=False)
+        train_sampler = DistributedSampler(
+            train_set, num_replicas=world_size, rank=rank,
+            shuffle=train_shuffle, seed=42,
+        )
+        val_sampler = DistributedSampler(
+            val_set, num_replicas=world_size, rank=rank,
+            shuffle=False, seed=42,
+        )
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, sampler=train_sampler,
+            num_workers=num_workers, pin_memory=True, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=batch_size, sampler=val_sampler,
+            num_workers=num_workers, pin_memory=True, drop_last=False,
+        )
     else:
-        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=train_shuffle,
-                                  num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                                num_workers=num_workers, pin_memory=True)
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, shuffle=train_shuffle,
+            num_workers=num_workers, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True,
+        )
 
     return train_loader, val_loader
 
 
 if __name__ == "__main__":
-    data_root = '/ix3/tibrahim/jil202/cfg_gen/qc_image_tif/mprage_2_tse/tse/coronal/'
+    import matplotlib.pyplot as plt
 
-    crop_size = 512
-    batch_size = 1
-    sample = 100
-    num_slices = 20
+    data_root = "/home/rflab/jil202/grappa-recon/dataset_grappa_nii"
+    contrast = "mprage"
 
-    print("Testing 3D context dataset:")
-    train_loader, val_loader = getloader_3d(batch_size, data_root, crop_size, num_slices, sample)
+    print(f"Building datasets for contrast={contrast} ...")
+    train_loader, val_loader = getloader_3d_patches(
+        batch_size=1, data_root=data_root, contrast=contrast,
+        sample=0.5, num_workers=0,
+    )
+    print(f"train batches: {len(train_loader)}, val batches: {len(val_loader)}")
 
-    for batch in train_loader:
-        mprage_volume, tse_volume = batch
-        print(f"3D - mprage shape: {mprage_volume.shape}, tse shape: {tse_volume.shape}")
-        for idx in range(len(mprage_volume.squeeze())):
-            m_slice = mprage_volume.squeeze()[idx]
-            t_slice = tse_volume.squeeze()[idx]
-            print(f"Slice {idx:03d} | mprage min: {m_slice.min():.4f}, max: {m_slice.max():.4f} | "
-                        f"tse min: {t_slice.min():.4f}, max: {t_slice.max():.4f}")
-            vis = torch.hstack((m_slice, t_slice))
-            plt.imshow(vis, cmap='gray')
-            plt.savefig(f'{idx}.png')
-            plt.close()
+    for condition, target, prev_chunk in train_loader:
+        print(
+            f"condition  {tuple(condition.shape)}  range "
+            f"[{condition.min():.4f}, {condition.max():.4f}]\n"
+            f"target     {tuple(target.shape)}  range "
+            f"[{target.min():.4f}, {target.max():.4f}]\n"
+            f"prev_chunk {tuple(prev_chunk.shape)}  range "
+            f"[{prev_chunk.min():.4f}, {prev_chunk.max():.4f}]"
+        )
+        c = condition[0, 0, :, :, condition.shape[-1] // 2].cpu().numpy()
+        t = target[0, 0, :, :, target.shape[-1] // 2].cpu().numpy()
+        p = prev_chunk[0, 0, :, :, prev_chunk.shape[-1] // 2].cpu().numpy()
+        plt.figure(figsize=(12, 4))
+        for i, (img, name) in enumerate([(c, "condition"), (t, "target"), (p, "prev_chunk")]):
+            plt.subplot(1, 3, i + 1)
+            plt.imshow(img, cmap="gray")
+            plt.title(name)
+            plt.axis("off")
+        plt.tight_layout()
+        plt.savefig("dataset_smoketest.png")
+        plt.close()
+        print("Saved dataset_smoketest.png")
         break

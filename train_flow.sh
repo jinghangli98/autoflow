@@ -41,6 +41,11 @@ srun python -m torch.distributed.run \
     --rdzv_id=$SLURM_JOB_ID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    train_flow.py --lr 3e-4 --batch_size 4 --crop_size 384 --resize_size 384 --max_epochs 100 --save_model --fp16 --sample 100 --distributed --world_size 12 --compile --checkpoint_path /ix3/tibrahim/jil202/cfg_gen/src/training_mprage2mp2rage/training_2d/autoregressive/autoregressive_ssim_8.01_epoch_3_1000.pt
-
-#python -m torch.distributed.run --nproc_per_node=4 train_flow.py   --distributed --fp16 --save_model --compile   --batch_size 2 --max_epochs 100 --save_model --fp16 --sample 10 --checkpoint_path ./checkpoints/flow_matching_best_epoch_38.pt
+    train_flow.py \
+        --contrast mprage \
+        --data_root /home/rflab/jil202/grappa-recon/dataset_grappa_nii \
+        --lr 3e-4 --batch_size 2 --max_epochs 100 \
+        --num_sampling_steps 2 --sample 100 \
+        --save_model --fp16 --compile \
+        --distributed --world_size 12 \
+        --checkpoint_path ./checkpoints/flow_matching_3d_mprage.pt
