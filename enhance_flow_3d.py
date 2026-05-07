@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import os
+import re
 
 import nibabel as nib
 import numpy as np
@@ -26,10 +27,48 @@ from tqdm import tqdm
 
 PATCH_Z = 16
 PAD_MULT = 16
+CONTEXT_INPUT_DIM = 5
+CONTEXT_HIDDEN_DIM = 128
+CONTEXT_OUTPUT_DIM = 256
+
+_ACCEL_FILENAME_RE = re.compile(r"_(CS_)?R(\d+)$")
+
+
+class ContextEncoder(nn.Module):
+    """Mirror of training-time ContextEncoder."""
+
+    def __init__(self, in_dim=CONTEXT_INPUT_DIM, hidden_dim=CONTEXT_HIDDEN_DIM,
+                 out_dim=CONTEXT_OUTPUT_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, ctx_vec):
+        return self.net(ctx_vec).unsqueeze(1)
+
+
+def parse_accel_from_filename(input_path):
+    """Parse (is_cs, factor) from filenames like 'subject_R5.nii.gz' or 'subject_CS_R3.nii.gz'."""
+    name = os.path.basename(input_path)
+    name = re.sub(r"\.nii(\.gz)?$", "", name)
+    m = _ACCEL_FILENAME_RE.search(name)
+    if not m:
+        raise ValueError(f"Cannot parse accel suffix from {input_path}")
+    is_cs = m.group(1) is not None
+    factor = int(m.group(2))
+    return is_cs, factor
+
+
+def voxel_size_from_nii(img):
+    z = img.header.get_zooms()
+    return float(z[0]), float(z[1]), float(z[2])
 
 
 class AutoregressiveFlowMatcher(nn.Module):
-    """Slim 3D Flow Matching wrapper for inference (Euler / Heun / RK4)."""
+    """Slim 3D Flow Matching wrapper for inference (Euler / Heun / RK4) with context."""
 
     def __init__(self, model, sigma_min=0.001):
         super().__init__()
@@ -41,47 +80,47 @@ class AutoregressiveFlowMatcher(nn.Module):
         return torch.cat([x, condition, prev_chunk], dim=1)
 
     @torch.no_grad()
-    def sample_euler(self, condition, prev_chunk, num_steps, device):
+    def sample_euler(self, condition, prev_chunk, num_steps, device, context=None):
         x = torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
             v = self.model(self._step_input(x, condition, prev_chunk),
-                           (t * 999).long())
+                           (t * 999).long(), context=context)
             x = x + v * dt
         return x
 
     @torch.no_grad()
-    def sample_heun(self, condition, prev_chunk, num_steps, device):
+    def sample_heun(self, condition, prev_chunk, num_steps, device, context=None):
         x = torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
             v1 = self.model(self._step_input(x, condition, prev_chunk),
-                            (t * 999).long())
+                            (t * 999).long(), context=context)
             x_euler = x + v1 * dt
             t_next = torch.full((condition.shape[0],), min((i + 1) * dt, 1.0), device=device)
             v2 = self.model(self._step_input(x_euler, condition, prev_chunk),
-                            (t_next * 999).long())
+                            (t_next * 999).long(), context=context)
             x = x + dt * (v1 + v2) / 2.0
         return x
 
     @torch.no_grad()
-    def sample_rk4(self, condition, prev_chunk, num_steps, device):
+    def sample_rk4(self, condition, prev_chunk, num_steps, device, context=None):
         x = torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t_cur = torch.full((condition.shape[0],), i * dt, device=device)
             k1 = self.model(self._step_input(x, condition, prev_chunk),
-                            (t_cur * 999).long())
+                            (t_cur * 999).long(), context=context)
             t_mid = torch.full((condition.shape[0],), i * dt + 0.5 * dt, device=device)
             k2 = self.model(self._step_input(x + 0.5 * dt * k1, condition, prev_chunk),
-                            (t_mid * 999).long())
+                            (t_mid * 999).long(), context=context)
             k3 = self.model(self._step_input(x + 0.5 * dt * k2, condition, prev_chunk),
-                            (t_mid * 999).long())
+                            (t_mid * 999).long(), context=context)
             t_next = torch.full((condition.shape[0],), min((i + 1) * dt, 1.0), device=device)
             k4 = self.model(self._step_input(x + dt * k3, condition, prev_chunk),
-                            (t_next * 999).long())
+                            (t_next * 999).long(), context=context)
             x = x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
         return x
 
@@ -117,21 +156,39 @@ def load_model(checkpoint_path, device, args):
         spatial_dims=3,
         in_channels=3,
         out_channels=1,
-        channels=(64, 128, 256),
-        attention_levels=(False, False, True),
+        channels=(128, 256, 256),
+        attention_levels=(False, False, False),
         num_res_blocks=2,
-        num_head_channels=128,
-        with_conditioning=False,
+        num_head_channels=256,
+        with_conditioning=True,
+        cross_attention_dim=CONTEXT_OUTPUT_DIM,
     )
-    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    state = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in state.items()}
-    model.load_state_dict(state)
+    context_encoder = ContextEncoder()
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if not (isinstance(ckpt, dict) and "model" in ckpt):
+        raise ValueError(
+            f"Checkpoint at {checkpoint_path} does not contain 'model' / 'context_encoder' "
+            f"keys. Re-train with the context-aware train_flow.py."
+        )
+
+    model_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    model.load_state_dict(model_sd)
+    if "context_encoder" in ckpt:
+        ctx_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v
+                  for k, v in ckpt["context_encoder"].items()}
+        context_encoder.load_state_dict(ctx_sd)
+
     model.to(device).eval()
+    context_encoder.to(device).eval()
+
     if args.fp16:
         model = model.half()
+        context_encoder = context_encoder.half()
     if args.compile:
         model = torch.compile(model, backend="inductor")
-    return model
+
+    return model, context_encoder
 
 
 def pad_to_multiple(volume: torch.Tensor, mult: int):
@@ -166,13 +223,25 @@ def main():
     print(f"Using device: {device}")
 
     print(f"Loading checkpoint: {args.checkpoint_path}")
-    model = load_model(args.checkpoint_path, device, args)
+    model, context_encoder = load_model(args.checkpoint_path, device, args)
     flow = AutoregressiveFlowMatcher(model, sigma_min=args.sigma_min)
 
     print(f"Loading input: {args.input_path}")
     img = nib.load(args.input_path)
     raw = img.get_fdata().astype(np.float32)
     print(f"  raw shape={raw.shape}, range=[{raw.min():.2f}, {raw.max():.2f}]")
+
+    voxel = voxel_size_from_nii(img)
+    is_cs, accel_factor = parse_accel_from_filename(args.input_path)
+    ctx_dtype = torch.float16 if args.fp16 else torch.float32
+    ctx_vec = torch.tensor(
+        [voxel[0], voxel[1], voxel[2], 1.0 if is_cs else 0.0, float(accel_factor)],
+        device=device, dtype=ctx_dtype,
+    ).unsqueeze(0)
+    with torch.no_grad():
+        ctx_emb = context_encoder(ctx_vec)
+    print(f"  voxel={voxel}, accel={'CS' if is_cs else 'GRAPPA'} R{accel_factor}, "
+          f"ctx_emb shape={tuple(ctx_emb.shape)}")
 
     normalized = raw / 255.0
     vol_t = torch.from_numpy(normalized)
@@ -185,8 +254,7 @@ def main():
     n_chunks = z_dim // PATCH_Z
 
     x_pad, y_pad = padded.shape[0], padded.shape[1]
-    prev_chunk = torch.zeros((1, 1, x_pad, y_pad, PATCH_Z), device=device,
-                             dtype=torch.float16 if args.fp16 else torch.float32)
+    prev_chunk = torch.zeros((1, 1, x_pad, y_pad, PATCH_Z), device=device, dtype=ctx_dtype)
 
     if args.rk4:
         sampler = flow.sample_rk4
@@ -205,7 +273,7 @@ def main():
         if args.fp16:
             condition = condition.half()
 
-        gen = sampler(condition, prev_chunk, args.num_sampling_steps, device)
+        gen = sampler(condition, prev_chunk, args.num_sampling_steps, device, context=ctx_emb)
         gen_chunk = gen.float()
 
         output_padded[:, :, z0:z0 + PATCH_Z] = gen_chunk[0, 0].cpu()

@@ -10,6 +10,7 @@ contain the same patch coordinates with the corresponding undersampling.
 """
 
 import glob
+import json
 import os
 import random
 import re
@@ -24,6 +25,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 _PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
 _UNDERSAMPLED_SUFFIX_RE = re.compile(r"_(?:CS_)?R\d+$")
+_ACCEL_SUFFIX_RE = re.compile(r"^_(CS_)?R(\d+)$")
 
 
 def _is_gt_subject(name: str) -> bool:
@@ -62,15 +64,40 @@ def _load_patch(path: str) -> torch.Tensor:
     return torch.from_numpy(arr).unsqueeze(0)
 
 
-class PatchPairDataset(Dataset):
-    """One sample = (undersampled patch, GT patch, prev GT Z-patch).
+def _read_voxel_size(subject_dir: str, subject_name: str):
+    """Read voxel_size_mm from <subject>_params.json. Returns (vx, vy, vz)."""
+    params_path = os.path.join(subject_dir, f"{subject_name}_params.json")
+    with open(params_path) as f:
+        meta = json.load(f)
+    vx, vy, vz = meta["voxel_size_mm"]
+    return float(vx), float(vy), float(vz)
 
-    Each tensor returned is shape (1, 192, 192, 16) (channel-first 3D).
+
+def _parse_accel(sibling_name: str, gt_name: str):
+    """Parse (is_cs: bool, factor: int) from a sibling dir name like '<gt>_R3' / '<gt>_CS_R2'."""
+    if not sibling_name.startswith(gt_name):
+        raise ValueError(f"Sibling {sibling_name} does not start with GT {gt_name}")
+    suffix = sibling_name[len(gt_name):]
+    m = _ACCEL_SUFFIX_RE.match(suffix)
+    if not m:
+        raise ValueError(f"Cannot parse accel suffix from {sibling_name}")
+    is_cs = m.group(1) is not None
+    factor = int(m.group(2))
+    return is_cs, factor
+
+
+class PatchPairDataset(Dataset):
+    """One sample = (undersampled patch, GT patch, prev GT Z-patch, context_vec).
+
+    Each volume tensor is shape (1, 192, 192, 16). `context_vec` is a (5,)
+    float32 tensor: (voxel_x, voxel_y, voxel_z, is_cs, accel_factor).
     """
 
-    def __init__(self, samples, gt_index_by_subject, patch_shape=(192, 192, 16)):
+    def __init__(self, samples, gt_index_by_subject, gt_voxel_by_subject,
+                 patch_shape=(192, 192, 16)):
         self.samples = samples
         self.gt_index = gt_index_by_subject
+        self.gt_voxel = gt_voxel_by_subject
         self.patch_shape = patch_shape
 
     def __len__(self):
@@ -88,15 +115,22 @@ class PatchPairDataset(Dataset):
         else:
             prev_chunk = torch.zeros((1, *self.patch_shape), dtype=torch.float32)
 
-        return condition, target, prev_chunk
+        vx, vy, vz = self.gt_voxel[s["gt_subject"]]
+        ctx_vec = torch.tensor(
+            [vx, vy, vz, 1.0 if s["is_cs"] else 0.0, float(s["accel_factor"])],
+            dtype=torch.float32,
+        )
+
+        return condition, target, prev_chunk, ctx_vec
 
 
 def build_samples(data_root: str, split: str, contrast: str):
     """Enumerate (undersampled, GT) patch pairs for one split + contrast.
 
     Returns:
-        samples: list of dicts (see PatchPairDataset.__init__).
-        gt_index: dict gt_subject -> {(x,y,z): gt_path}.
+        samples:   list of dicts (see PatchPairDataset.__init__).
+        gt_index:  dict gt_subject -> {(x,y,z): gt_path}.
+        gt_voxel:  dict gt_subject -> (vx, vy, vz) in mm.
     """
     contrast_dir = os.path.join(data_root, split, contrast)
     if not os.path.isdir(contrast_dir):
@@ -110,15 +144,24 @@ def build_samples(data_root: str, split: str, contrast: str):
 
     samples = []
     gt_index = {}
+    gt_voxel = {}
     for gt in gt_subjects:
         gt_dir = os.path.join(contrast_dir, gt)
         gt_patches = _index_subject_patches(gt_dir)
         if not gt_patches:
             continue
         gt_index[gt] = gt_patches
+        try:
+            gt_voxel[gt] = _read_voxel_size(gt_dir, gt)
+        except (FileNotFoundError, KeyError):
+            gt_voxel[gt] = (1.0, 1.0, 1.0)
 
         siblings = _find_undersampled_siblings(contrast_dir, gt)
         for sib in siblings:
+            try:
+                is_cs, factor = _parse_accel(sib, gt)
+            except ValueError:
+                continue
             sib_dir = os.path.join(contrast_dir, sib)
             sib_patches = _index_subject_patches(sib_dir)
             for (x, y, z), us_path in sib_patches.items():
@@ -129,9 +172,11 @@ def build_samples(data_root: str, split: str, contrast: str):
                     "target_path": gt_patches[(x, y, z)],
                     "gt_subject": gt,
                     "x": x, "y": y, "z": z,
+                    "is_cs": is_cs,
+                    "accel_factor": factor,
                 })
 
-    return samples, gt_index
+    return samples, gt_index, gt_voxel
 
 
 def _subsample(samples, percent: float, seed: int = 42):
@@ -148,14 +193,14 @@ def get_dataset_3d_patches(data_root: str, contrast: str, sample: float = 100.0)
 
     Train comes from `train/`, validation from `test/`.
     """
-    train_samples, train_index = build_samples(data_root, "train", contrast)
-    val_samples, val_index = build_samples(data_root, "test", contrast)
+    train_samples, train_index, train_voxel = build_samples(data_root, "train", contrast)
+    val_samples, val_index, val_voxel = build_samples(data_root, "test", contrast)
 
     train_samples = _subsample(train_samples, sample, seed=42)
     val_samples = _subsample(val_samples, min(sample, 5.0), seed=43)
 
-    train_set = PatchPairDataset(train_samples, train_index)
-    val_set = PatchPairDataset(val_samples, val_index)
+    train_set = PatchPairDataset(train_samples, train_index, train_voxel)
+    val_set = PatchPairDataset(val_samples, val_index, val_voxel)
     return train_set, val_set
 
 
@@ -216,14 +261,15 @@ if __name__ == "__main__":
     )
     print(f"train batches: {len(train_loader)}, val batches: {len(val_loader)}")
 
-    for condition, target, prev_chunk in train_loader:
+    for condition, target, prev_chunk, ctx_vec in train_loader:
         print(
             f"condition  {tuple(condition.shape)}  range "
             f"[{condition.min():.4f}, {condition.max():.4f}]\n"
             f"target     {tuple(target.shape)}  range "
             f"[{target.min():.4f}, {target.max():.4f}]\n"
             f"prev_chunk {tuple(prev_chunk.shape)}  range "
-            f"[{prev_chunk.min():.4f}, {prev_chunk.max():.4f}]"
+            f"[{prev_chunk.min():.4f}, {prev_chunk.max():.4f}]\n"
+            f"ctx_vec    {tuple(ctx_vec.shape)}  values {ctx_vec.tolist()}"
         )
         c = condition[0, 0, :, :, condition.shape[-1] // 2].cpu().numpy()
         t = target[0, 0, :, :, target.shape[-1] // 2].cpu().numpy()

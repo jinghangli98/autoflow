@@ -9,13 +9,12 @@ Inputs are 5D tensors `(B, 1, X, Y, Z)`. The model concatenates
 `(B, 3, X, Y, Z)` and predicts a velocity field of shape `(B, 1, X, Y, Z)`.
 
 Usage:
-    python -m torch.distributed.run --nproc_per_node=2 train_flow.py \
+    python -m torch.distributed.run --nproc_per_node=3 train_flow.py \
         --contrast mprage \
         --data_root /home/rflab/jil202/grappa-recon/dataset_grappa_nii \
         --distributed --fp16 --save_model --compile \
-        --batch_size 2 --max_epochs 100 --sample 100 \
-        --num_sampling_steps 2 \
-        --checkpoint_path ./checkpoints/flow_matching_3d_mprage.pt
+        --batch_size 4 --max_epochs 100 --sample 3 \
+        --num_sampling_steps 2
 """
 
 import argparse
@@ -38,20 +37,42 @@ from metrics import evaluate_image_quality
 from utils import EMA
 
 
+CONTEXT_INPUT_DIM = 5      # (vx, vy, vz, is_cs, accel_factor)
+CONTEXT_HIDDEN_DIM = 128
+CONTEXT_OUTPUT_DIM = 256   # must match cross_attention_dim on the UNet
+
+
+class ContextEncoder(nn.Module):
+    """Encode (B, in_dim) raw scalar context into (B, 1, out_dim) for cross-attention."""
+
+    def __init__(self, in_dim=CONTEXT_INPUT_DIM, hidden_dim=CONTEXT_HIDDEN_DIM,
+                 out_dim=CONTEXT_OUTPUT_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, ctx_vec):
+        return self.net(ctx_vec).unsqueeze(1)
+
+
 class AutoregressiveFlowMatcher(nn.Module):
-    """Autoregressive Flow Matching for 3D patch translation."""
+    """Autoregressive Flow Matching for 3D patch translation, with context conditioning."""
 
     def __init__(self, model, sigma_min=0.001):
         super().__init__()
         self.model = model
         self.sigma_min = sigma_min
 
-    def forward(self, x0, x1, condition, prev_chunk, t):
+    def forward(self, x0, x1, condition, prev_chunk, t, context=None):
         """Compute the flow matching loss on a 3D patch.
 
         Shapes:
             x0, x1, condition, prev_chunk : (B, 1, X, Y, Z)
             t                             : (B,) or (1,)
+            context                       : (B, seq_len, cross_attention_dim) or None
         """
         batch_size = x0.shape[0]
         if t.dim() == 0:
@@ -68,11 +89,11 @@ class AutoregressiveFlowMatcher(nn.Module):
         timesteps = (t * 999).long()
         model_input = torch.cat([x_t, condition, prev_chunk], dim=1)
 
-        v_pred = self.model(model_input, timesteps)
+        v_pred = self.model(model_input, timesteps, context=context)
         return F.mse_loss(v_pred, v_t)
 
     @torch.no_grad()
-    def sample(self, condition, prev_chunk, num_steps=50, device="cuda"):
+    def sample(self, condition, prev_chunk, num_steps=50, device="cuda", context=None):
         """Euler ODE integration in 3D."""
         batch_size = condition.shape[0]
         x = torch.randn_like(condition).to(device)
@@ -82,7 +103,7 @@ class AutoregressiveFlowMatcher(nn.Module):
             t = torch.full((batch_size,), i * dt, device=device)
             timesteps = (t * 999).long()
             model_input = torch.cat([x, condition, prev_chunk], dim=1)
-            v = self.model(model_input, timesteps)
+            v = self.model(model_input, timesteps, context=context)
             x = x + v * dt
 
         return x
@@ -223,7 +244,7 @@ def visualize_flow_results(epoch, flow_matcher, device, condition, target, args,
     return metrics["SSIM"], metrics["PSNR"], metrics["LPIPS"]
 
 
-def validate_one_step(flow_matcher, device, condition, target, args):
+def validate_one_step(flow_matcher, device, condition, target, args, context=None):
     """Sample once on a 3D patch, return SSIM/PSNR/LPIPS on central slice + the full generated patch."""
     flow_matcher.eval()
     with torch.no_grad():
@@ -232,6 +253,7 @@ def validate_one_step(flow_matcher, device, condition, target, args):
             prev_chunk=torch.zeros_like(condition),
             num_steps=args.num_sampling_steps,
             device=device,
+            context=context,
         )
 
     cz = condition.shape[-1] // 2
@@ -304,17 +326,30 @@ def train(local_rank, args):
         attention_levels=(False, False, False),
         num_res_blocks=2,
         num_head_channels=256,
-        with_conditioning=False,
+        with_conditioning=True,
+        cross_attention_dim=CONTEXT_OUTPUT_DIM,
     )
+    context_encoder = ContextEncoder()
 
     if os.path.exists(args.checkpoint_path):
         if global_rank == 0:
             print(f"Loading checkpoint from {args.checkpoint_path}")
-        state_dict = torch.load(args.checkpoint_path, map_location=f"cuda:{local_rank}", weights_only=True)
-        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict)
+        ckpt = torch.load(args.checkpoint_path, map_location=f"cuda:{local_rank}", weights_only=True)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            model_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+            model.load_state_dict(model_sd)
+            if "context_encoder" in ckpt:
+                ctx_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["context_encoder"].items()}
+                context_encoder.load_state_dict(ctx_sd)
+        else:
+            # Backward-compat: legacy checkpoint with bare model state dict (no context_encoder).
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt.items()}
+            model.load_state_dict(state_dict, strict=False)
+            if global_rank == 0:
+                print("Legacy checkpoint loaded; context_encoder initialized from scratch.")
 
     model.to(device)
+    context_encoder.to(device)
 
     if args.compile:
         model = torch.compile(model)
@@ -325,9 +360,14 @@ def train(local_rank, args):
         if dist.is_initialized():
             dist.barrier()
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        context_encoder = DDP(context_encoder, device_ids=[local_rank],
+                              output_device=local_rank, find_unused_parameters=False)
         flow_matcher.model = model
 
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        params=list(model.parameters()) + list(context_encoder.parameters()),
+        lr=args.lr, weight_decay=0.01,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.max_epochs, eta_min=1e-6,
     )
@@ -336,6 +376,8 @@ def train(local_rank, args):
     best_ssim_psnr = 0
     ema = EMA(model, args.ema_decay)
     ema.register()
+    ema_ctx = EMA(context_encoder, args.ema_decay)
+    ema_ctx.register()
 
     if global_rank == 0:
         print(f"Starting 3D flow matching training (world_size={args.world_size})")
@@ -359,10 +401,11 @@ def train(local_rank, args):
         else:
             progress_bar = enumerate(train_loader)
 
-        for step, (condition, target, prev_chunk) in progress_bar:
+        for step, (condition, target, prev_chunk, ctx_vec) in progress_bar:
             condition = condition.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             prev_chunk = prev_chunk.to(device, non_blocking=True)
+            ctx_vec = ctx_vec.to(device, non_blocking=True)
 
             robust_prev = apply_prev_chunk_robustness(prev_chunk, args, device)
 
@@ -371,9 +414,11 @@ def train(local_rank, args):
 
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.fp16):
                 x0 = torch.randn_like(target)
+                ctx_emb = context_encoder(ctx_vec)
                 loss = flow_matcher(
                     x0=x0, x1=target,
                     condition=condition, prev_chunk=robust_prev, t=t,
+                    context=ctx_emb,
                 )
 
             nan_flag = torch.tensor(
@@ -397,6 +442,7 @@ def train(local_rank, args):
 
             if epoch >= args.ema_start_epoch:
                 ema.update()
+                ema_ctx.update()
 
             epoch_loss += loss.item()
 
@@ -422,8 +468,10 @@ def train(local_rank, args):
             use_ema = (epoch >= args.ema_start_epoch)
             if use_ema:
                 ema.apply_shadow()
+                ema_ctx.apply_shadow()
 
             model.eval()
+            context_encoder.eval()
 
             val_ssim = 0
             val_psnr = 0
@@ -434,9 +482,11 @@ def train(local_rank, args):
             max_val_images_per_rank = max(1, 1000 // max(1, world_size))
             val_images_seen = 0
 
-            for i, (condition, target, _prev) in enumerate(val_loader):
+            for i, (condition, target, _prev, ctx_vec) in enumerate(val_loader):
                 condition = condition.to(device)
                 target = target.to(device)
+                ctx_vec = ctx_vec.to(device)
+                ctx_emb = context_encoder(ctx_vec)
 
                 batch_ssim, batch_psnr, batch_lpips, generated = validate_one_step(
                     flow_matcher=flow_matcher,
@@ -444,6 +494,7 @@ def train(local_rank, args):
                     condition=condition,
                     target=target,
                     args=args,
+                    context=ctx_emb,
                 )
 
                 val_ssim += batch_ssim
@@ -492,10 +543,9 @@ def train(local_rank, args):
                 if ssim_psnr > best_ssim_psnr:
                     best_ssim_psnr = ssim_psnr
                     checkpoint_path = f"./checkpoints/flow_matching_3d_{args.contrast}_best_epoch_{epoch}.pt"
-                    if args.distributed:
-                        torch.save(model.module.state_dict(), checkpoint_path)
-                    else:
-                        torch.save(model.state_dict(), checkpoint_path)
+                    model_sd = model.module.state_dict() if args.distributed else model.state_dict()
+                    ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
+                    torch.save({"model": model_sd, "context_encoder": ctx_sd}, checkpoint_path)
                     print(f"Saved best model with Score: {ssim_psnr:.4f}")
 
             if args.log and global_rank == 0:
@@ -510,13 +560,13 @@ def train(local_rank, args):
 
             if use_ema:
                 ema.restore()
+                ema_ctx.restore()
 
     if global_rank == 0 and args.save_model:
         final_path = f"./checkpoints/flow_matching_3d_{args.contrast}_final.pt"
-        if args.distributed:
-            torch.save(model.module.state_dict(), final_path)
-        else:
-            torch.save(model.state_dict(), final_path)
+        model_sd = model.module.state_dict() if args.distributed else model.state_dict()
+        ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
+        torch.save({"model": model_sd, "context_encoder": ctx_sd}, final_path)
 
     if args.distributed:
         dist.barrier()
