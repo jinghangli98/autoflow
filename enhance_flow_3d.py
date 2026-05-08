@@ -6,10 +6,10 @@ matching with autoregressive prev_chunk, stitches along Z, unpads, and saves.
 
 Usage:
     python enhance_flow_3d.py \
-        --checkpoint_path ./checkpoints/flow_matching_3d_mprage.pt \
-        --input_path /home/rflab/jil202/grappa-recon/nii/mprage/532_5_R5.nii.gz \
-        --output_path ./outputs/532_5_R5_recon.nii.gz \
-        --num_sampling_steps 1 --euler --auto --fp16
+        --checkpoint_path /ix1/tibrahim/jil202/autoflow/checkpoints/flow_matching_3d_mprage_mp2rage_flair_tse_swi_best_epoch_9.pt \
+        --input_path /ix1/tibrahim/jil202/autoflow/532_5_R3.nii.gz \
+        --output_path ./outputs/532_5_R3_recon.nii.gz \
+        --num_sampling_steps 1 --euler --auto --fp16 --non_overlap 20
 """
 
 import argparse
@@ -87,7 +87,7 @@ class AutoregressiveFlowMatcher(nn.Module):
             t = torch.full((condition.shape[0],), i * dt, device=device)
             v = self.model(self._step_input(x, condition, prev_chunk),
                            (t * 999).long(), context=context)
-            x = x + v * dt
+            x = torch.clamp(x + v * dt, -3, 3)
         return x
 
     @torch.no_grad()
@@ -98,11 +98,11 @@ class AutoregressiveFlowMatcher(nn.Module):
             t = torch.full((condition.shape[0],), i * dt, device=device)
             v1 = self.model(self._step_input(x, condition, prev_chunk),
                             (t * 999).long(), context=context)
-            x_euler = x + v1 * dt
+            x_euler = torch.clamp(x + v1 * dt, -3, 3)
             t_next = torch.full((condition.shape[0],), min((i + 1) * dt, 1.0), device=device)
             v2 = self.model(self._step_input(x_euler, condition, prev_chunk),
                             (t_next * 999).long(), context=context)
-            x = x + dt * (v1 + v2) / 2.0
+            x = torch.clamp(x + dt * (v1 + v2) / 2.0, -3, 3)
         return x
 
     @torch.no_grad()
@@ -114,15 +114,32 @@ class AutoregressiveFlowMatcher(nn.Module):
             k1 = self.model(self._step_input(x, condition, prev_chunk),
                             (t_cur * 999).long(), context=context)
             t_mid = torch.full((condition.shape[0],), i * dt + 0.5 * dt, device=device)
-            k2 = self.model(self._step_input(x + 0.5 * dt * k1, condition, prev_chunk),
+            k2 = self.model(self._step_input(torch.clamp(x + 0.5 * dt * k1, -3, 3), condition, prev_chunk),
                             (t_mid * 999).long(), context=context)
-            k3 = self.model(self._step_input(x + 0.5 * dt * k2, condition, prev_chunk),
+            k3 = self.model(self._step_input(torch.clamp(x + 0.5 * dt * k2, -3, 3), condition, prev_chunk),
                             (t_mid * 999).long(), context=context)
             t_next = torch.full((condition.shape[0],), min((i + 1) * dt, 1.0), device=device)
-            k4 = self.model(self._step_input(x + dt * k3, condition, prev_chunk),
+            k4 = self.model(self._step_input(torch.clamp(x + dt * k3, -3, 3), condition, prev_chunk),
                             (t_next * 999).long(), context=context)
-            x = x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+            x = torch.clamp(x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0, -3, 3)
         return x
+
+
+def make_blend_window(patch_z, non_overlap, dtype=torch.float32):
+    """1D Z-axis blend weights for overlap-and-add inference.
+
+    `non_overlap` is the number of overlapping slices between consecutive
+    chunks (stride = patch_z - non_overlap). The window has linear ramps
+    over the first/last `non_overlap` slices and is 1.0 in the middle.
+    Weights are strictly positive (min = 1/(non_overlap+1)) so the
+    final divide is safe without clamping.
+    """
+    w = torch.ones(patch_z, dtype=dtype)
+    if non_overlap > 0:
+        ramp = torch.arange(1, non_overlap + 1, dtype=dtype) / (non_overlap + 1)
+        w[:non_overlap] = ramp
+        w[-non_overlap:] = ramp.flip(0)
+    return w
 
 
 def parse_args():
@@ -133,6 +150,11 @@ def parse_args():
     p.add_argument("--output_path", type=str, required=True)
 
     p.add_argument("--num_sampling_steps", type=int, default=1)
+    p.add_argument("--non_overlap", type=int, default=0,
+                   help="Number of overlapping slices between consecutive Z-chunks. "
+                        "Stride = PATCH_Z - non_overlap. 0 = no overlap (default); "
+                        "1 -> stride 31; 2 -> stride 30; etc. Overlap region is "
+                        "linearly blended via sum/weight accumulation.")
     p.add_argument("--euler", action="store_true",
                    help="Use Euler ODE (default if neither --heun nor --rk4)")
     p.add_argument("--heun", action="store_true")
@@ -140,6 +162,8 @@ def parse_args():
 
     p.add_argument("--auto", action="store_true",
                    help="Use generated previous chunk as prev_chunk for next step")
+    p.add_argument("--reverse", action="store_true",
+                   help="Iterate Z-chunks top-down instead of bottom-up")
 
     p.add_argument("--sigma_min", type=float, default=0.001)
     p.add_argument("--fp16", action="store_true")
@@ -148,6 +172,19 @@ def parse_args():
                    help="Rescale output back to ~[0, 255] uint16 before save")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--voxel_size", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "Z"),
+                   help="Override voxel size (mm) instead of reading from NIfTI header")
+    p.add_argument("--is_cs", action="store_true",
+                   help="Mark acquisition as Compressed Sensing (CS). "
+                        "If neither --is_cs nor --is_grappa is set, parsed from filename.")
+    p.add_argument("--is_grappa", action="store_true",
+                   help="Mark acquisition as GRAPPA. "
+                        "If neither --is_cs nor --is_grappa is set, parsed from filename.")
+    p.add_argument("--accel_factor", type=int, default=None,
+                   help="Acceleration factor R (e.g. 3, 5). "
+                        "If unset, parsed from filename.")
     return p.parse_args()
 
 
@@ -156,10 +193,10 @@ def load_model(checkpoint_path, device, args):
         spatial_dims=3,
         in_channels=3,
         out_channels=1,
-        channels=(128, 256, 256),
+        channels=(128, 256, 512),
         attention_levels=(False, False, False),
         num_res_blocks=2,
-        num_head_channels=256,
+        num_head_channels=512,
         with_conditioning=True,
         cross_attention_dim=CONTEXT_OUTPUT_DIM,
     )
@@ -191,19 +228,21 @@ def load_model(checkpoint_path, device, args):
     return model, context_encoder
 
 
-def pad_to_multiple(volume: torch.Tensor, mult: int):
-    """Center-pad a 3D tensor (X, Y, Z) so each dim is a multiple of `mult`."""
-    def _amount(n):
-        rem = n % mult
-        if rem == 0:
-            return 0, 0
-        total = mult - rem
+def pad_to_multiple(volume: torch.Tensor, mult: int, min_z: int = 0):
+    """Center-pad a 3D tensor (X, Y, Z) so each dim is a multiple of `mult`,
+    with the Z dim padded to at least `min_z` slices."""
+    def _amount(n, min_n=0):
+        target = max(n, min_n)
+        rem = target % mult
+        if rem != 0:
+            target += mult - rem
+        total = target - n
         l = total // 2
         return l, total - l
 
     x_l, x_r = _amount(volume.shape[0])
     y_l, y_r = _amount(volume.shape[1])
-    z_l, z_r = _amount(volume.shape[2])
+    z_l, z_r = _amount(volume.shape[2], min_z)
     padded = F.pad(volume, (z_l, z_r, y_l, y_r, x_l, x_r), mode="constant", value=0.0)
     return padded, ((x_l, x_r), (y_l, y_r), (z_l, z_r)), volume.shape
 
@@ -212,6 +251,33 @@ def unpad(volume: torch.Tensor, pad_info, original_shape):
     (x_l, x_r), (y_l, y_r), (z_l, z_r) = pad_info
     ox, oy, oz = original_shape
     return volume[x_l:x_l + ox, y_l:y_l + oy, z_l:z_l + oz]
+
+
+def resolve_context(args, img):
+    """Pick voxel size and (is_cs, accel_factor) from CLI flags, falling back to
+    the NIfTI header / filename when not explicitly provided."""
+    if args.voxel_size is not None:
+        voxel = (float(args.voxel_size[0]),
+                 float(args.voxel_size[1]),
+                 float(args.voxel_size[2]))
+    else:
+        voxel = voxel_size_from_nii(img)
+
+    if args.is_cs and args.is_grappa:
+        raise ValueError("Pass at most one of --is_cs / --is_grappa")
+
+    cs_flag_set = args.is_cs or args.is_grappa
+    if cs_flag_set and args.accel_factor is not None:
+        is_cs = bool(args.is_cs)
+        accel_factor = int(args.accel_factor)
+    elif cs_flag_set or args.accel_factor is not None:
+        parsed_is_cs, parsed_factor = parse_accel_from_filename(args.input_path)
+        is_cs = bool(args.is_cs) if cs_flag_set else parsed_is_cs
+        accel_factor = int(args.accel_factor) if args.accel_factor is not None else parsed_factor
+    else:
+        is_cs, accel_factor = parse_accel_from_filename(args.input_path)
+
+    return voxel, is_cs, accel_factor
 
 
 def main():
@@ -231,8 +297,7 @@ def main():
     raw = img.get_fdata().astype(np.float32)
     print(f"  raw shape={raw.shape}, range=[{raw.min():.2f}, {raw.max():.2f}]")
 
-    voxel = voxel_size_from_nii(img)
-    is_cs, accel_factor = parse_accel_from_filename(args.input_path)
+    voxel, is_cs, accel_factor = resolve_context(args, img)
     ctx_dtype = torch.float16 if args.fp16 else torch.float32
     ctx_vec = torch.tensor(
         [voxel[0], voxel[1], voxel[2], 1.0 if is_cs else 0.0, float(accel_factor)],
@@ -246,12 +311,33 @@ def main():
     normalized = raw / 255.0
     vol_t = torch.from_numpy(normalized)
 
-    padded, pad_info, original_shape = pad_to_multiple(vol_t, PAD_MULT)
+    padded, pad_info, original_shape = pad_to_multiple(vol_t, PAD_MULT, min_z=PATCH_Z)
     print(f"  padded shape={tuple(padded.shape)}")
 
-    output_padded = torch.zeros_like(padded)
     z_dim = padded.shape[2]
-    n_chunks = z_dim // PATCH_Z
+    non_overlap = max(0, args.non_overlap)
+    if non_overlap >= PATCH_Z:
+        raise ValueError(
+            f"--non_overlap must be in [0, {PATCH_Z - 1}]; got {non_overlap}"
+        )
+    stride = PATCH_Z - non_overlap
+
+    chunk_starts = []
+    z = 0
+    while z + PATCH_Z <= z_dim:
+        chunk_starts.append(z)
+        z += stride
+    if not chunk_starts or chunk_starts[-1] + PATCH_Z < z_dim:
+        chunk_starts.append(z_dim - PATCH_Z)
+
+    if args.reverse:
+        chunk_starts.reverse()
+
+    window_1d = make_blend_window(PATCH_Z, non_overlap, dtype=padded.dtype)
+    window = window_1d.view(1, 1, -1)
+
+    output_sum = torch.zeros_like(padded)
+    output_weight = torch.zeros_like(padded)
 
     x_pad, y_pad = padded.shape[0], padded.shape[1]
     prev_chunk = torch.zeros((1, 1, x_pad, y_pad, PATCH_Z), device=device, dtype=ctx_dtype)
@@ -265,28 +351,35 @@ def main():
     else:
         sampler = flow.sample_euler
         sampler_name = "euler"
-    print(f"  sampler={sampler_name}, steps={args.num_sampling_steps}, auto={args.auto}")
+    print(f"  sampler={sampler_name}, steps={args.num_sampling_steps}, auto={args.auto}, "
+          f"reverse={args.reverse}, non_overlap={non_overlap}, stride={stride}, "
+          f"n_chunks={len(chunk_starts)}")
 
-    for ci in tqdm(range(n_chunks), desc="Z-chunks"):
-        z0 = ci * PATCH_Z
+    for ci, z0 in enumerate(tqdm(chunk_starts, desc="Z-chunks")):
         condition = padded[:, :, z0:z0 + PATCH_Z].unsqueeze(0).unsqueeze(0).to(device)
         if args.fp16:
             condition = condition.half()
 
-        gen = sampler(condition, prev_chunk, args.num_sampling_steps, device, context=ctx_emb)
-        gen_chunk = gen.float()
+        torch.manual_seed(args.seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(args.seed)
 
-        output_padded[:, :, z0:z0 + PATCH_Z] = gen_chunk[0, 0].cpu()
+        gen = sampler(condition, prev_chunk, args.num_sampling_steps, device, context=ctx_emb)
+        gen_chunk_cpu = gen[0, 0].float().cpu()
+
+        output_sum[:, :, z0:z0 + PATCH_Z] += gen_chunk_cpu * window
+        output_weight[:, :, z0:z0 + PATCH_Z] += window
 
         if args.auto:
             prev_chunk = gen.detach()
         else:
             prev_chunk = torch.zeros_like(prev_chunk)
 
+    output_padded = output_sum / output_weight.clamp(min=1e-8)
     out_unpadded = unpad(output_padded, pad_info, original_shape).numpy()
 
     if args.rescale:
-        out_unpadded = np.clip(out_unpadded * 255.0, 0, 65535).astype(np.uint16)
+        out_unpadded = np.rint(np.clip(out_unpadded * 255.0, 0, 255)).astype(np.uint8)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)) or ".", exist_ok=True)
     out_img = nib.Nifti1Image(out_unpadded, img.affine, img.header)

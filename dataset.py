@@ -11,6 +11,7 @@ contain the same patch coordinates with the corresponding undersampling.
 
 import glob
 import json
+import math
 import os
 import random
 import re
@@ -19,7 +20,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -188,41 +189,173 @@ def _subsample(samples, percent: float, seed: int = 42):
     return rng.sample(samples, n)
 
 
-def get_dataset_3d_patches(data_root: str, contrast: str, sample: float = 100.0):
-    """Build train + val datasets for one contrast.
+def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0):
+    """Build train + val datasets for one or more contrasts.
+
+    `contrast` may be a single string or a list/tuple of strings. When multiple
+    contrasts are given, samples are concatenated and subject keys are
+    namespaced as `<contrast>/<subject>` to avoid cross-contrast collisions.
+
+    The returned datasets carry a `contrast_indices` attribute mapping each
+    contrast name to the list of dataset indices belonging to that contrast,
+    so a balanced sampler can draw evenly across contrasts.
 
     Train comes from `train/`, validation from `test/`.
     """
-    train_samples, train_index, train_voxel = build_samples(data_root, "train", contrast)
-    val_samples, val_index, val_voxel = build_samples(data_root, "test", contrast)
+    contrasts = [contrast] if isinstance(contrast, str) else list(contrast)
+    multi = len(contrasts) > 1
 
-    train_samples = _subsample(train_samples, sample, seed=42)
-    val_samples = _subsample(val_samples, min(sample, 5.0), seed=43)
+    train_samples_all, val_samples_all = [], []
+    train_index_all, train_voxel_all = {}, {}
+    val_index_all, val_voxel_all = {}, {}
+    train_contrast_indices, val_contrast_indices = {}, {}
 
-    train_set = PatchPairDataset(train_samples, train_index, train_voxel)
-    val_set = PatchPairDataset(val_samples, val_index, val_voxel)
+    for c in contrasts:
+        tr_samples, tr_index, tr_voxel = build_samples(data_root, "train", c)
+        v_samples, v_index, v_voxel = build_samples(data_root, "test", c)
+
+        tr_samples = _subsample(tr_samples, sample, seed=42)
+        v_samples = _subsample(v_samples, min(sample, 5.0), seed=43)
+
+        if multi:
+            for s in tr_samples:
+                s["gt_subject"] = f"{c}/{s['gt_subject']}"
+            for s in v_samples:
+                s["gt_subject"] = f"{c}/{s['gt_subject']}"
+            tr_index = {f"{c}/{k}": v for k, v in tr_index.items()}
+            tr_voxel = {f"{c}/{k}": v for k, v in tr_voxel.items()}
+            v_index = {f"{c}/{k}": v for k, v in v_index.items()}
+            v_voxel = {f"{c}/{k}": v for k, v in v_voxel.items()}
+
+        train_contrast_indices[c] = list(
+            range(len(train_samples_all), len(train_samples_all) + len(tr_samples))
+        )
+        val_contrast_indices[c] = list(
+            range(len(val_samples_all), len(val_samples_all) + len(v_samples))
+        )
+
+        train_samples_all.extend(tr_samples)
+        val_samples_all.extend(v_samples)
+        train_index_all.update(tr_index)
+        train_voxel_all.update(tr_voxel)
+        val_index_all.update(v_index)
+        val_voxel_all.update(v_voxel)
+
+    train_set = PatchPairDataset(train_samples_all, train_index_all, train_voxel_all)
+    val_set = PatchPairDataset(val_samples_all, val_index_all, val_voxel_all)
+    train_set.contrast_indices = train_contrast_indices
+    val_set.contrast_indices = val_contrast_indices
     return train_set, val_set
+
+
+class BalancedDistributedSampler(Sampler):
+    """Yields an equal number of samples per contrast each epoch.
+
+    Each epoch reseeds via `seed + epoch`, so the larger contrast cycles
+    through different random subsets across epochs. Compatible with DDP via
+    rank/num_replicas slicing (set `num_replicas=1, rank=0` for non-DDP).
+
+    If `samples_per_contrast` exceeds a contrast's pool, that contrast is
+    oversampled with replacement to reach the target.
+    """
+
+    def __init__(self, contrast_indices, samples_per_contrast=0,
+                 num_replicas=1, rank=0, shuffle=True, seed=42):
+        if not contrast_indices:
+            raise ValueError("contrast_indices is empty")
+        self.contrast_indices = {k: list(v) for k, v in contrast_indices.items() if v}
+        if samples_per_contrast is None or samples_per_contrast <= 0:
+            samples_per_contrast = min(len(v) for v in self.contrast_indices.values())
+        self.samples_per_contrast = samples_per_contrast
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        n_total = samples_per_contrast * len(self.contrast_indices)
+        self.num_samples = math.ceil(n_total / num_replicas)
+        self.total_size = self.num_samples * num_replicas
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        indices = []
+        for idxs in self.contrast_indices.values():
+            n = self.samples_per_contrast
+            pool = torch.tensor(idxs)
+            if n <= len(idxs):
+                perm = torch.randperm(len(idxs), generator=g)[:n]
+                chosen = pool[perm].tolist()
+            else:
+                extra_n = n - len(idxs)
+                extra = pool[torch.randint(0, len(idxs), (extra_n,), generator=g)]
+                chosen = pool.tolist() + extra.tolist()
+            indices.extend(chosen)
+
+        if self.shuffle:
+            order = torch.randperm(len(indices), generator=g).tolist()
+            indices = [indices[i] for i in order]
+
+        if len(indices) < self.total_size:
+            indices += indices[: self.total_size - len(indices)]
+        else:
+            indices = indices[: self.total_size]
+
+        return iter(indices[self.rank : self.total_size : self.num_replicas])
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
 
 def getloader_3d_patches(
     batch_size: int,
     data_root: str,
-    contrast: str,
+    contrast,
     sample: float = 100.0,
     num_workers: int = 4,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
     train_shuffle: bool = True,
+    samples_per_contrast=None,
 ):
-    """DataLoaders for 3D NIfTI patch reconstruction. DDP-aware."""
+    """DataLoaders for 3D NIfTI patch reconstruction. DDP-aware.
+
+    `contrast` may be a single string or a list/tuple of strings.
+
+    If `samples_per_contrast` is not None, training uses
+    `BalancedDistributedSampler`: each contrast contributes the same number of
+    samples per epoch (0 = auto-balance to the smallest contrast). The larger
+    contrast(s) cycle through different random subsets across epochs.
+    Validation always uses standard sampling.
+    """
     train_set, val_set = get_dataset_3d_patches(data_root, contrast, sample)
 
-    if distributed:
+    use_balanced = samples_per_contrast is not None
+
+    if use_balanced:
+        train_sampler = BalancedDistributedSampler(
+            train_set.contrast_indices,
+            samples_per_contrast=samples_per_contrast,
+            num_replicas=world_size if distributed else 1,
+            rank=rank if distributed else 0,
+            shuffle=train_shuffle,
+            seed=42,
+        )
+    elif distributed:
         train_sampler = DistributedSampler(
             train_set, num_replicas=world_size, rank=rank,
             shuffle=train_shuffle, seed=42,
         )
+    else:
+        train_sampler = None
+
+    if distributed:
         val_sampler = DistributedSampler(
             val_set, num_replicas=world_size, rank=rank,
             shuffle=False, seed=42,
@@ -237,7 +370,9 @@ def getloader_3d_patches(
         )
     else:
         train_loader = DataLoader(
-            train_set, batch_size=batch_size, shuffle=train_shuffle,
+            train_set, batch_size=batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None) and train_shuffle,
             num_workers=num_workers, pin_memory=True,
         )
         val_loader = DataLoader(

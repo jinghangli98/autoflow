@@ -9,11 +9,11 @@ Inputs are 5D tensors `(B, 1, X, Y, Z)`. The model concatenates
 `(B, 3, X, Y, Z)` and predicts a velocity field of shape `(B, 1, X, Y, Z)`.
 
 Usage:
-    python -m torch.distributed.run --nproc_per_node=3 train_flow.py \
+    python -m torch.distributed.run --nproc_per_node=8 train_flow.py \
         --contrast mprage \
-        --data_root /home/rflab/jil202/grappa-recon/dataset_grappa_nii \
+        --data_root /ix1/tibrahim/jil202/studies/dataset_grappa_nii \
         --distributed --fp16 --save_model --compile \
-        --batch_size 4 --max_epochs 100 --sample 3 \
+        --batch_size 4 --max_epochs 100 --sample 100 \
         --num_sampling_steps 2
 """
 
@@ -116,9 +116,10 @@ def parse_args():
     parser.add_argument("--data_root", type=str,
                         default="/home/rflab/jil202/grappa-recon/dataset_grappa_nii",
                         help="Root containing train/<contrast>/ and test/<contrast>/")
-    parser.add_argument("--contrast", type=str, required=True,
-                        choices=["mprage", "tse"],
-                        help="Which contrast to train on (one model per contrast)")
+    parser.add_argument("--contrast", type=str, required=True, nargs="+",
+                        choices=["mprage", "tse", "mp2rage", "swi", "flair"],
+                        help="One or more contrasts to train on, e.g. "
+                             "`--contrast mprage` or `--contrast mprage tse`")
 
     # Training
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -127,6 +128,11 @@ def parse_args():
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--sample", type=float, default=10.0,
                         help="Percentage of (undersampled,GT) sample pairs to use")
+    parser.add_argument("--samples_per_contrast", type=int, default=None,
+                        help="If set, each contrast contributes this many "
+                             "training samples per epoch (0 = auto-balance to "
+                             "the smallest contrast). The larger contrast "
+                             "cycles through a fresh random subset each epoch.")
     parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--save_model", action="store_true")
     parser.add_argument("--fp16", action="store_true",
@@ -305,6 +311,7 @@ def train(local_rank, args):
             sample=args.sample,
             distributed=True, rank=global_rank, world_size=world_size,
             num_workers=args.num_workers,
+            samples_per_contrast=args.samples_per_contrast,
         )
     else:
         train_loader, val_loader = getloader_3d_patches(
@@ -313,6 +320,7 @@ def train(local_rank, args):
             contrast=args.contrast,
             sample=args.sample,
             num_workers=args.num_workers,
+            samples_per_contrast=args.samples_per_contrast,
         )
 
     if global_rank == 0:
@@ -322,10 +330,10 @@ def train(local_rank, args):
         spatial_dims=3,
         in_channels=3,
         out_channels=1,
-        channels=(128, 256, 256),
+        channels=(128, 256, 512),
         attention_levels=(False, False, False),
         num_res_blocks=2,
-        num_head_channels=256,
+        num_head_channels=512,
         with_conditioning=True,
         cross_attention_dim=CONTEXT_OUTPUT_DIM,
     )
@@ -383,10 +391,10 @@ def train(local_rank, args):
         print(f"Starting 3D flow matching training (world_size={args.world_size})")
 
     for epoch in range(args.max_epochs):
-        if args.distributed:
-            for loader in [train_loader, val_loader]:
-                if hasattr(loader.sampler, "set_epoch"):
-                    loader.sampler.set_epoch(epoch)
+        for loader in [train_loader, val_loader]:
+            sampler = getattr(loader, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
 
         if epoch == args.ema_start_epoch:
             if global_rank == 0:
@@ -542,7 +550,8 @@ def train(local_rank, args):
                 ssim_psnr = 0.7 * avg_ssim + 0.3 * avg_psnr
                 if ssim_psnr > best_ssim_psnr:
                     best_ssim_psnr = ssim_psnr
-                    checkpoint_path = f"./checkpoints/flow_matching_3d_{args.contrast}_best_epoch_{epoch}.pt"
+                    contrast_tag = "_".join(args.contrast)
+                    checkpoint_path = f"./checkpoints/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
                     ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
                     torch.save({"model": model_sd, "context_encoder": ctx_sd}, checkpoint_path)
@@ -563,7 +572,8 @@ def train(local_rank, args):
                 ema_ctx.restore()
 
     if global_rank == 0 and args.save_model:
-        final_path = f"./checkpoints/flow_matching_3d_{args.contrast}_final.pt"
+        contrast_tag = "_".join(args.contrast)
+        final_path = f"./checkpoints/flow_matching_3d_{contrast_tag}_final.pt"
         model_sd = model.module.state_dict() if args.distributed else model.state_dict()
         ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
         torch.save({"model": model_sd, "context_encoder": ctx_sd}, final_path)
