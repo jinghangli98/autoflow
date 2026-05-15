@@ -1,12 +1,12 @@
 """3D NIfTI Flow Matching Training Script.
 
 Conditional flow matching for accelerated MRI reconstruction. The model takes
-an undersampled 3D patch (`condition`) and a previous-Z GT patch (`prev_chunk`)
-and predicts the velocity field that maps noise to the GT patch.
+an undersampled 3D patch (`condition`) and predicts the velocity field that
+maps noise to the GT patch.
 
 Inputs are 5D tensors `(B, 1, X, Y, Z)`. The model concatenates
-`(noisy_target, condition, prev_chunk)` along the channel dim ->
-`(B, 3, X, Y, Z)` and predicts a velocity field of shape `(B, 1, X, Y, Z)`.
+`(noisy_target, condition)` along the channel dim -> `(B, 2, X, Y, Z)` and
+predicts a velocity field of shape `(B, 1, X, Y, Z)`.
 
 Usage:
     python -m torch.distributed.run --nproc_per_node=8 train_flow.py \
@@ -19,7 +19,6 @@ Usage:
 
 import argparse
 import os
-import random
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -37,13 +36,17 @@ from metrics import evaluate_image_quality
 from utils import EMA
 
 
-CONTEXT_INPUT_DIM = 5      # (vx, vy, vz, is_cs, accel_factor)
+CONTEXT_INPUT_DIM = 7      # (vx, vy, vz, log1p(TR), log1p(TE), log1p(TI), FA/180)
 CONTEXT_HIDDEN_DIM = 128
 CONTEXT_OUTPUT_DIM = 256   # must match cross_attention_dim on the UNet
 
 
 class ContextEncoder(nn.Module):
-    """Encode (B, in_dim) raw scalar context into (B, 1, out_dim) for cross-attention."""
+    """Encode (B, in_dim) raw scalar context into (B, 1, out_dim) for cross-attention.
+
+    Carries a learnable null embedding used as the unconditional signal for
+    classifier-free guidance.
+    """
 
     def __init__(self, in_dim=CONTEXT_INPUT_DIM, hidden_dim=CONTEXT_HIDDEN_DIM,
                  out_dim=CONTEXT_OUTPUT_DIM):
@@ -53,26 +56,30 @@ class ContextEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, out_dim),
         )
+        self.null_emb = nn.Parameter(torch.zeros(1, 1, out_dim))
 
     def forward(self, ctx_vec):
         return self.net(ctx_vec).unsqueeze(1)
 
+    def null(self, batch_size: int):
+        return self.null_emb.expand(batch_size, -1, -1)
 
-class AutoregressiveFlowMatcher(nn.Module):
-    """Autoregressive Flow Matching for 3D patch translation, with context conditioning."""
+
+class FlowMatcher(nn.Module):
+    """Flow Matching for 3D patch translation, with context conditioning."""
 
     def __init__(self, model, sigma_min=0.001):
         super().__init__()
         self.model = model
         self.sigma_min = sigma_min
 
-    def forward(self, x0, x1, condition, prev_chunk, t, context=None):
+    def forward(self, x0, x1, condition, t, context=None):
         """Compute the flow matching loss on a 3D patch.
 
         Shapes:
-            x0, x1, condition, prev_chunk : (B, 1, X, Y, Z)
-            t                             : (B,) or (1,)
-            context                       : (B, seq_len, cross_attention_dim) or None
+            x0, x1, condition : (B, 1, X, Y, Z)
+            t                 : (B,) or (1,)
+            context           : (B, seq_len, cross_attention_dim) or None
         """
         batch_size = x0.shape[0]
         if t.dim() == 0:
@@ -87,13 +94,13 @@ class AutoregressiveFlowMatcher(nn.Module):
 
         v_t = x1 - x0
         timesteps = (t * 999).long()
-        model_input = torch.cat([x_t, condition, prev_chunk], dim=1)
+        model_input = torch.cat([x_t, condition], dim=1)
 
         v_pred = self.model(model_input, timesteps, context=context)
         return F.mse_loss(v_pred, v_t)
 
     @torch.no_grad()
-    def sample(self, condition, prev_chunk, num_steps=50, device="cuda", context=None):
+    def sample(self, condition, num_steps=50, device="cuda", context=None):
         """Euler ODE integration in 3D."""
         batch_size = condition.shape[0]
         x = torch.randn_like(condition).to(device)
@@ -102,7 +109,7 @@ class AutoregressiveFlowMatcher(nn.Module):
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=device)
             timesteps = (t * 999).long()
-            model_input = torch.cat([x, condition, prev_chunk], dim=1)
+            model_input = torch.cat([x, condition], dim=1)
             v = self.model(model_input, timesteps, context=context)
             x = x + v * dt
 
@@ -148,13 +155,10 @@ def parse_args():
     parser.add_argument("--sigma_min", type=float, default=0.001)
     parser.add_argument("--num_sampling_steps", type=int, default=2)
 
-    # Autoregressive prev_chunk robustness
-    parser.add_argument("--prev_chunk_dropout", type=float, default=0.3,
-                        help="Probability of zeroing prev_chunk")
-    parser.add_argument("--prev_chunk_noise", type=float, default=0.15,
-                        help="Std of additive noise on prev_chunk")
-    parser.add_argument("--noise_prob", type=float, default=0.5,
-                        help="Probability of applying additive noise to prev_chunk")
+    # Classifier-free guidance
+    parser.add_argument("--cfg_dropout_prob", type=float, default=0.1,
+                        help="Probability of replacing the encoded context "
+                             "with the learnable null embedding during training.")
 
     # EMA
     parser.add_argument("--ema_decay", type=float, default=0.9999)
@@ -170,19 +174,6 @@ def parse_args():
     parser.add_argument("--master_port", type=str, default="29500")
 
     return parser.parse_args()
-
-
-def apply_prev_chunk_robustness(prev_chunk, args, device):
-    """Apply robustness techniques to prev_chunk during training."""
-    if random.random() < args.prev_chunk_dropout:
-        return torch.zeros_like(prev_chunk)
-
-    if random.random() < args.noise_prob:
-        noise = torch.randn_like(prev_chunk) * args.prev_chunk_noise
-        prev_chunk = prev_chunk + noise
-        prev_chunk = torch.clamp(prev_chunk, 0.0, 1.0)
-
-    return prev_chunk
 
 
 def setup_distributed(rank, world_size, local_rank, backend="nccl"):
@@ -209,16 +200,13 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def visualize_flow_results(epoch, flow_matcher, device, condition, target, args, local_rank, prev_chunk=None):
+def visualize_flow_results(epoch, flow_matcher, device, condition, target, args, local_rank):
     """Run flow sample on a single 3D patch, save central-slice 3-panel viz, return metrics."""
     flow_matcher.eval()
-    if prev_chunk is None:
-        prev_chunk = torch.zeros_like(condition)
 
     with torch.no_grad():
         generated = flow_matcher.sample(
             condition=condition,
-            prev_chunk=prev_chunk,
             num_steps=args.num_sampling_steps,
             device=device,
         )
@@ -256,7 +244,6 @@ def validate_one_step(flow_matcher, device, condition, target, args, context=Non
     with torch.no_grad():
         generated = flow_matcher.sample(
             condition=condition,
-            prev_chunk=torch.zeros_like(condition),
             num_steps=args.num_sampling_steps,
             device=device,
             context=context,
@@ -328,7 +315,7 @@ def train(local_rank, args):
 
     model = DiffusionModelUNet(
         spatial_dims=3,
-        in_channels=3,
+        in_channels=2,
         out_channels=1,
         channels=(128, 256, 512),
         attention_levels=(False, False, False),
@@ -343,16 +330,56 @@ def train(local_rank, args):
         if global_rank == 0:
             print(f"Loading checkpoint from {args.checkpoint_path}")
         ckpt = torch.load(args.checkpoint_path, map_location=f"cuda:{local_rank}", weights_only=True)
+
+        def _load_relaxed(target_module, src_sd, label):
+            tgt_sd = target_module.state_dict()
+            filtered = {}
+            skipped = []
+            partial = []
+            for k, v in src_sd.items():
+                if k not in tgt_sd:
+                    skipped.append((k, tuple(v.shape), None))
+                    continue
+                tv = tgt_sd[k]
+                if v.shape == tv.shape:
+                    filtered[k] = v
+                    continue
+                if v.dim() == tv.dim() and all(
+                    (sd == td) or (i == 1)
+                    for i, (sd, td) in enumerate(zip(v.shape, tv.shape))
+                ):
+                    new_v = tv.clone()
+                    c = min(v.shape[1], tv.shape[1])
+                    slicer_src = (slice(None), slice(0, c)) + (slice(None),) * (v.dim() - 2)
+                    slicer_tgt = (slice(None), slice(0, c)) + (slice(None),) * (tv.dim() - 2)
+                    new_v[slicer_tgt] = v[slicer_src]
+                    filtered[k] = new_v
+                    partial.append((k, tuple(v.shape), tuple(tv.shape), c))
+                else:
+                    skipped.append((k, tuple(v.shape), tuple(tv.shape)))
+            missing, unexpected = target_module.load_state_dict(filtered, strict=False)
+            if global_rank == 0:
+                if partial:
+                    for k, sshape, tshape, c in partial:
+                        print(f"  [{label}] partial copy {k}: ckpt {sshape} -> model {tshape}, copied {c} channels along dim 1")
+                if skipped:
+                    for k, sshape, tshape in skipped:
+                        print(f"  [{label}] skipped {k}: ckpt {sshape} vs model {tshape}")
+                if missing:
+                    print(f"  [{label}] missing keys: {len(missing)}")
+                if unexpected:
+                    print(f"  [{label}] unexpected keys: {len(unexpected)}")
+
         if isinstance(ckpt, dict) and "model" in ckpt:
             model_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
-            model.load_state_dict(model_sd)
+            _load_relaxed(model, model_sd, "model")
             if "context_encoder" in ckpt:
                 ctx_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["context_encoder"].items()}
-                context_encoder.load_state_dict(ctx_sd)
+                _load_relaxed(context_encoder, ctx_sd, "context_encoder")
         else:
             # Backward-compat: legacy checkpoint with bare model state dict (no context_encoder).
             state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt.items()}
-            model.load_state_dict(state_dict, strict=False)
+            _load_relaxed(model, state_dict, "model")
             if global_rank == 0:
                 print("Legacy checkpoint loaded; context_encoder initialized from scratch.")
 
@@ -362,7 +389,7 @@ def train(local_rank, args):
     if args.compile:
         model = torch.compile(model)
 
-    flow_matcher = AutoregressiveFlowMatcher(model, sigma_min=args.sigma_min)
+    flow_matcher = FlowMatcher(model, sigma_min=args.sigma_min)
 
     if args.distributed:
         if dist.is_initialized():
@@ -409,13 +436,10 @@ def train(local_rank, args):
         else:
             progress_bar = enumerate(train_loader)
 
-        for step, (condition, target, prev_chunk, ctx_vec) in progress_bar:
+        for step, (condition, target, ctx_vec) in progress_bar:
             condition = condition.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            prev_chunk = prev_chunk.to(device, non_blocking=True)
             ctx_vec = ctx_vec.to(device, non_blocking=True)
-
-            robust_prev = apply_prev_chunk_robustness(prev_chunk, args, device)
 
             optimizer.zero_grad(set_to_none=True)
             t = torch.rand(condition.shape[0], device=device)
@@ -423,9 +447,14 @@ def train(local_rank, args):
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.fp16):
                 x0 = torch.randn_like(target)
                 ctx_emb = context_encoder(ctx_vec)
+                if args.cfg_dropout_prob > 0:
+                    bsz = ctx_emb.shape[0]
+                    ctx_module = context_encoder.module if args.distributed else context_encoder
+                    drop = (torch.rand(bsz, 1, 1, device=device) < args.cfg_dropout_prob)
+                    ctx_emb = torch.where(drop, ctx_module.null(bsz), ctx_emb)
                 loss = flow_matcher(
                     x0=x0, x1=target,
-                    condition=condition, prev_chunk=robust_prev, t=t,
+                    condition=condition, t=t,
                     context=ctx_emb,
                 )
 
@@ -490,7 +519,7 @@ def train(local_rank, args):
             max_val_images_per_rank = max(1, 1000 // max(1, world_size))
             val_images_seen = 0
 
-            for i, (condition, target, _prev, ctx_vec) in enumerate(val_loader):
+            for i, (condition, target, ctx_vec) in enumerate(val_loader):
                 condition = condition.to(device)
                 target = target.to(device)
                 ctx_vec = ctx_vec.to(device)

@@ -1,12 +1,21 @@
-"""3D NIfTI patch dataset for autoregressive flow matching.
+"""3D NIfTI patch dataset for flow matching.
 
 Pairs undersampled patches (GRAPPA `_R{3..6}` / CS `_CS_R{2,3}`) with their
 matching ground-truth patches inside a single contrast (mprage or tse).
 
 Layout assumed:
-  <data_root>/<split>/<contrast>/<subject>/patch_<x>_<y>_<z>.nii.gz
-where <subject> is the GT id (no suffix) and siblings <subject>_R3, ..., _CS_R3
-contain the same patch coordinates with the corresponding undersampling.
+  <data_root>/<split>/<contrast>/<subject>[_<orient>]/patch_<x>_<y>_<z>.nii.gz
+where <subject> is the GT id (no suffix), `<orient>` is one of
+{coronal, sagittal} (omitted for axial), and siblings
+`<subject>_R<n>[_<orient>]` / `<subject>_CS_R<n>[_<orient>]` contain the same
+patch coordinates with the corresponding undersampling.
+
+Patch shapes on disk vary by orientation:
+  axial:    (192, 192, 16)
+  coronal:  (192, 16, 192)
+  sagittal: (16, 192, 192)
+All patches are transposed to (192, 192, 16) on load so the model sees a
+single canonical layout.
 """
 
 import glob
@@ -26,24 +35,45 @@ from torch.utils.data.distributed import DistributedSampler
 
 _PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
 _UNDERSAMPLED_SUFFIX_RE = re.compile(r"_(?:CS_)?R\d+$")
-_ACCEL_SUFFIX_RE = re.compile(r"^_(CS_)?R(\d+)$")
+_ORIENTATIONS = ("coronal", "sagittal")
+
+
+def _parse_subject(name: str):
+    """Split a directory name into (base_subject, orientation).
+
+    `orientation` is one of {"axial", "coronal", "sagittal"}. The orientation
+    suffix (when present) comes *after* any undersampling suffix, e.g.
+    `1041_R3_coronal` -> base=`1041_R3`, orientation=`coronal`.
+    """
+    for orient in _ORIENTATIONS:
+        suffix = f"_{orient}"
+        if name.endswith(suffix):
+            return name[: -len(suffix)], orient
+    return name, "axial"
 
 
 def _is_gt_subject(name: str) -> bool:
     """Return True if a subject directory name has no `_R*`/`_CS_R*` suffix."""
-    return _UNDERSAMPLED_SUFFIX_RE.search(name) is None
+    base, _ = _parse_subject(name)
+    return _UNDERSAMPLED_SUFFIX_RE.search(base) is None
 
 
 def _find_undersampled_siblings(contrast_dir: str, gt_name: str):
     """Find sibling undersampled subject dirs for a given GT subject name.
 
-    A sibling matches `<gt_name>_R<digit>+` or `<gt_name>_CS_R<digit>+` exactly.
+    Siblings share the GT's orientation suffix. For an axial GT `1041`,
+    matches `1041_R<n>` / `1041_CS_R<n>`. For `1041_coronal`, matches
+    `1041_R<n>_coronal` / `1041_CS_R<n>_coronal`.
     """
+    base, orientation = _parse_subject(gt_name)
+    orient_suffix = "" if orientation == "axial" else f"_{orientation}"
+    pattern = re.compile(
+        rf"^{re.escape(base)}_(?:CS_)?R\d+{re.escape(orient_suffix)}$"
+    )
     candidates = sorted(
         d for d in os.listdir(contrast_dir)
         if os.path.isdir(os.path.join(contrast_dir, d))
     )
-    pattern = re.compile(rf"^{re.escape(gt_name)}_(?:CS_)?R\d+$")
     return [c for c in candidates if pattern.match(c)]
 
 
@@ -59,46 +89,67 @@ def _index_subject_patches(subject_dir: str):
     return out
 
 
-def _load_patch(path: str) -> torch.Tensor:
-    """Load a single 192x192x16 NIfTI patch as float32 tensor (1, 192, 192, 16)."""
+def _load_patch(path: str, orientation: str = "axial") -> torch.Tensor:
+    """Load a NIfTI patch as float32 tensor (1, 192, 192, 16).
+
+    On-disk shapes differ by orientation; we transpose so the slab (16) axis
+    is always last.
+    """
     arr = nib.load(path).get_fdata().astype(np.float32)
-    return torch.from_numpy(arr).unsqueeze(0)
+    if orientation == "coronal":
+        # (192, 16, 192) -> (192, 192, 16)
+        arr = np.moveaxis(arr, 1, -1)
+    elif orientation == "sagittal":
+        # (16, 192, 192) -> (192, 192, 16)
+        arr = np.moveaxis(arr, 0, -1)
+    return torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
 
 
-def _read_voxel_size(subject_dir: str, subject_name: str):
-    """Read voxel_size_mm from <subject>_params.json. Returns (vx, vy, vz)."""
-    params_path = os.path.join(subject_dir, f"{subject_name}_params.json")
+def _read_meta(subject_dir: str, subject_name: str):
+    """Read sequence params from <base_subject>_params.json.
+
+    For oriented dirs (e.g. `1041_coronal/`), params still live under the
+    base id (`1041_params.json`). Returns
+    (vx, vy, vz, TR_s, TE_s, TI_s, FlipAngle_deg).
+    """
+    base, _ = _parse_subject(subject_name)
+    params_path = os.path.join(subject_dir, f"{base}_params.json")
     with open(params_path) as f:
         meta = json.load(f)
     vx, vy, vz = meta["voxel_size_mm"]
-    return float(vx), float(vy), float(vz)
+    return (
+        float(vx), float(vy), float(vz),
+        float(meta["RepetitionTime"]),
+        float(meta["EchoTime"]),
+        float(meta["InversionTime"]),
+        float(meta["FlipAngle"]),
+    )
 
 
-def _parse_accel(sibling_name: str, gt_name: str):
-    """Parse (is_cs: bool, factor: int) from a sibling dir name like '<gt>_R3' / '<gt>_CS_R2'."""
-    if not sibling_name.startswith(gt_name):
-        raise ValueError(f"Sibling {sibling_name} does not start with GT {gt_name}")
-    suffix = sibling_name[len(gt_name):]
-    m = _ACCEL_SUFFIX_RE.match(suffix)
-    if not m:
-        raise ValueError(f"Cannot parse accel suffix from {sibling_name}")
-    is_cs = m.group(1) is not None
-    factor = int(m.group(2))
-    return is_cs, factor
+def encode_context_vec(vx, vy, vz, tr, te, ti, fa):
+    """Build the 7-dim context vector with log1p TR/TE/TI and FA/180."""
+    return torch.tensor(
+        [
+            float(vx), float(vy), float(vz),
+            math.log1p(float(tr)),
+            math.log1p(float(te)),
+            math.log1p(float(ti)),
+            float(fa) / 180.0,
+        ],
+        dtype=torch.float32,
+    )
 
 
 class PatchPairDataset(Dataset):
-    """One sample = (undersampled patch, GT patch, prev GT Z-patch, context_vec).
+    """One sample = (undersampled patch, GT patch, context_vec).
 
-    Each volume tensor is shape (1, 192, 192, 16). `context_vec` is a (5,)
-    float32 tensor: (voxel_x, voxel_y, voxel_z, is_cs, accel_factor).
+    Each volume tensor is shape (1, 192, 192, 16). `context_vec` is a (7,)
+    float32 tensor: (vx, vy, vz, log1p(TR), log1p(TE), log1p(TI), FA/180).
     """
 
-    def __init__(self, samples, gt_index_by_subject, gt_voxel_by_subject,
-                 patch_shape=(192, 192, 16)):
+    def __init__(self, samples, gt_meta_by_subject, patch_shape=(192, 192, 16)):
         self.samples = samples
-        self.gt_index = gt_index_by_subject
-        self.gt_voxel = gt_voxel_by_subject
+        self.gt_meta = gt_meta_by_subject
         self.patch_shape = patch_shape
 
     def __len__(self):
@@ -106,32 +157,20 @@ class PatchPairDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        condition = _load_patch(s["condition_path"])
-        target = _load_patch(s["target_path"])
+        orientation = s.get("orientation", "axial")
+        condition = _load_patch(s["condition_path"], orientation)
+        target = _load_patch(s["target_path"], orientation)
 
-        prev_key = (s["x"], s["y"], s["z"] - 1)
-        prev_path = self.gt_index[s["gt_subject"]].get(prev_key)
-        if s["z"] > 0 and prev_path is not None:
-            prev_chunk = _load_patch(prev_path)
-        else:
-            prev_chunk = torch.zeros((1, *self.patch_shape), dtype=torch.float32)
-
-        vx, vy, vz = self.gt_voxel[s["gt_subject"]]
-        ctx_vec = torch.tensor(
-            [vx, vy, vz, 1.0 if s["is_cs"] else 0.0, float(s["accel_factor"])],
-            dtype=torch.float32,
-        )
-
-        return condition, target, prev_chunk, ctx_vec
+        ctx_vec = encode_context_vec(*self.gt_meta[s["gt_subject"]])
+        return condition, target, ctx_vec
 
 
 def build_samples(data_root: str, split: str, contrast: str):
     """Enumerate (undersampled, GT) patch pairs for one split + contrast.
 
     Returns:
-        samples:   list of dicts (see PatchPairDataset.__init__).
-        gt_index:  dict gt_subject -> {(x,y,z): gt_path}.
-        gt_voxel:  dict gt_subject -> (vx, vy, vz) in mm.
+        samples:  list of dicts (see PatchPairDataset.__init__).
+        gt_meta:  dict gt_subject -> (vx, vy, vz, TR, TE, TI, FA).
     """
     contrast_dir = os.path.join(data_root, split, contrast)
     if not os.path.isdir(contrast_dir):
@@ -144,25 +183,21 @@ def build_samples(data_root: str, split: str, contrast: str):
     gt_subjects = [s for s in all_subjects if _is_gt_subject(s)]
 
     samples = []
-    gt_index = {}
-    gt_voxel = {}
+    gt_meta = {}
     for gt in gt_subjects:
         gt_dir = os.path.join(contrast_dir, gt)
         gt_patches = _index_subject_patches(gt_dir)
         if not gt_patches:
             continue
-        gt_index[gt] = gt_patches
         try:
-            gt_voxel[gt] = _read_voxel_size(gt_dir, gt)
-        except (FileNotFoundError, KeyError):
-            gt_voxel[gt] = (1.0, 1.0, 1.0)
+            gt_meta[gt] = _read_meta(gt_dir, gt)
+        except (FileNotFoundError, KeyError, TypeError):
+            # Skip subjects missing required sequence params.
+            continue
 
+        _, orientation = _parse_subject(gt)
         siblings = _find_undersampled_siblings(contrast_dir, gt)
         for sib in siblings:
-            try:
-                is_cs, factor = _parse_accel(sib, gt)
-            except ValueError:
-                continue
             sib_dir = os.path.join(contrast_dir, sib)
             sib_patches = _index_subject_patches(sib_dir)
             for (x, y, z), us_path in sib_patches.items():
@@ -172,12 +207,10 @@ def build_samples(data_root: str, split: str, contrast: str):
                     "condition_path": us_path,
                     "target_path": gt_patches[(x, y, z)],
                     "gt_subject": gt,
-                    "x": x, "y": y, "z": z,
-                    "is_cs": is_cs,
-                    "accel_factor": factor,
+                    "orientation": orientation,
                 })
 
-    return samples, gt_index, gt_voxel
+    return samples, gt_meta
 
 
 def _subsample(samples, percent: float, seed: int = 42):
@@ -206,13 +239,13 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0):
     multi = len(contrasts) > 1
 
     train_samples_all, val_samples_all = [], []
-    train_index_all, train_voxel_all = {}, {}
-    val_index_all, val_voxel_all = {}, {}
+    train_meta_all = {}
+    val_meta_all = {}
     train_contrast_indices, val_contrast_indices = {}, {}
 
     for c in contrasts:
-        tr_samples, tr_index, tr_voxel = build_samples(data_root, "train", c)
-        v_samples, v_index, v_voxel = build_samples(data_root, "test", c)
+        tr_samples, tr_meta = build_samples(data_root, "train", c)
+        v_samples, v_meta = build_samples(data_root, "test", c)
 
         tr_samples = _subsample(tr_samples, sample, seed=42)
         v_samples = _subsample(v_samples, min(sample, 5.0), seed=43)
@@ -222,10 +255,8 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0):
                 s["gt_subject"] = f"{c}/{s['gt_subject']}"
             for s in v_samples:
                 s["gt_subject"] = f"{c}/{s['gt_subject']}"
-            tr_index = {f"{c}/{k}": v for k, v in tr_index.items()}
-            tr_voxel = {f"{c}/{k}": v for k, v in tr_voxel.items()}
-            v_index = {f"{c}/{k}": v for k, v in v_index.items()}
-            v_voxel = {f"{c}/{k}": v for k, v in v_voxel.items()}
+            tr_meta = {f"{c}/{k}": v for k, v in tr_meta.items()}
+            v_meta = {f"{c}/{k}": v for k, v in v_meta.items()}
 
         train_contrast_indices[c] = list(
             range(len(train_samples_all), len(train_samples_all) + len(tr_samples))
@@ -236,13 +267,11 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0):
 
         train_samples_all.extend(tr_samples)
         val_samples_all.extend(v_samples)
-        train_index_all.update(tr_index)
-        train_voxel_all.update(tr_voxel)
-        val_index_all.update(v_index)
-        val_voxel_all.update(v_voxel)
+        train_meta_all.update(tr_meta)
+        val_meta_all.update(v_meta)
 
-    train_set = PatchPairDataset(train_samples_all, train_index_all, train_voxel_all)
-    val_set = PatchPairDataset(val_samples_all, val_index_all, val_voxel_all)
+    train_set = PatchPairDataset(train_samples_all, train_meta_all)
+    val_set = PatchPairDataset(val_samples_all, val_meta_all)
     train_set.contrast_indices = train_contrast_indices
     val_set.contrast_indices = val_contrast_indices
     return train_set, val_set
@@ -396,22 +425,19 @@ if __name__ == "__main__":
     )
     print(f"train batches: {len(train_loader)}, val batches: {len(val_loader)}")
 
-    for condition, target, prev_chunk, ctx_vec in train_loader:
+    for condition, target, ctx_vec in train_loader:
         print(
             f"condition  {tuple(condition.shape)}  range "
             f"[{condition.min():.4f}, {condition.max():.4f}]\n"
             f"target     {tuple(target.shape)}  range "
             f"[{target.min():.4f}, {target.max():.4f}]\n"
-            f"prev_chunk {tuple(prev_chunk.shape)}  range "
-            f"[{prev_chunk.min():.4f}, {prev_chunk.max():.4f}]\n"
             f"ctx_vec    {tuple(ctx_vec.shape)}  values {ctx_vec.tolist()}"
         )
         c = condition[0, 0, :, :, condition.shape[-1] // 2].cpu().numpy()
         t = target[0, 0, :, :, target.shape[-1] // 2].cpu().numpy()
-        p = prev_chunk[0, 0, :, :, prev_chunk.shape[-1] // 2].cpu().numpy()
-        plt.figure(figsize=(12, 4))
-        for i, (img, name) in enumerate([(c, "condition"), (t, "target"), (p, "prev_chunk")]):
-            plt.subplot(1, 3, i + 1)
+        plt.figure(figsize=(8, 4))
+        for i, (img, name) in enumerate([(c, "condition"), (t, "target")]):
+            plt.subplot(1, 2, i + 1)
             plt.imshow(img, cmap="gray")
             plt.title(name)
             plt.axis("off")
