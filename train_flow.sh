@@ -3,18 +3,18 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cluster=gpu
-#SBATCH --partition=preempt
+#SBATCH --partition=rtx6k
 #SBATCH --mail-user=jil202@pitt.edu
 #SBATCH --mail-type=END,FAIL
 #SBATCH --time=0-98:00:00
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:6
 
 
 # # Properly activate conda environment
 source activate vsr
 nvidia-smi
 
-python -m torch.distributed.run --nproc_per_node=4 train_flow.py \
+python -m torch.distributed.run --nproc_per_node=6 train_flow.py \
         --contrast mprage mp2rage flair tse swi \
         --data_root /ix1/tibrahim/jil202/studies/dataset_grappa_nii \
         --distributed --fp16 --save_model --compile \

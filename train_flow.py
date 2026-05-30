@@ -100,8 +100,26 @@ class FlowMatcher(nn.Module):
         return F.mse_loss(v_pred, v_t)
 
     @torch.no_grad()
-    def sample(self, condition, num_steps=50, device="cuda", context=None):
-        """Euler ODE integration in 3D."""
+    def _guided_velocity(self, model_input, timesteps, context, null_context,
+                         guidance_scale):
+        """Velocity with optional classifier-free guidance.
+
+        guidance_scale == 1.0 (or no null_context) -> single conditional eval.
+        guidance_scale == 0.0 -> single unconditional eval (pure null context).
+        otherwise -> two evals mixed as v_uncond + scale * (v_cond - v_uncond).
+        """
+        if guidance_scale == 1.0 or null_context is None:
+            return self.model(model_input, timesteps, context=context)
+        if guidance_scale == 0.0:
+            return self.model(model_input, timesteps, context=null_context)
+        v_cond = self.model(model_input, timesteps, context=context)
+        v_uncond = self.model(model_input, timesteps, context=null_context)
+        return v_uncond + guidance_scale * (v_cond - v_uncond)
+
+    @torch.no_grad()
+    def sample(self, condition, num_steps=50, device="cuda", context=None,
+               null_context=None, guidance_scale=1.0):
+        """Euler ODE integration in 3D, with optional classifier-free guidance."""
         batch_size = condition.shape[0]
         x = torch.randn_like(condition).to(device)
         dt = 1.0 / num_steps
@@ -110,7 +128,9 @@ class FlowMatcher(nn.Module):
             t = torch.full((batch_size,), i * dt, device=device)
             timesteps = (t * 999).long()
             model_input = torch.cat([x, condition], dim=1)
-            v = self.model(model_input, timesteps, context=context)
+            v = self._guided_velocity(
+                model_input, timesteps, context, null_context, guidance_scale,
+            )
             x = x + v * dt
 
         return x
@@ -159,6 +179,15 @@ def parse_args():
     parser.add_argument("--cfg_dropout_prob", type=float, default=0.1,
                         help="Probability of replacing the encoded context "
                              "with the learnable null embedding during training.")
+    parser.add_argument("--val_guidance_scales", type=float, nargs="+",
+                        default=[0.0, 1.0, 1.5],
+                        help="Guidance scales evaluated each validation. "
+                             "0.0 = unconditional (no context), 1.0 = plain "
+                             "conditional, >1.0 = classifier-free guidance.")
+    parser.add_argument("--ckpt_guidance_scale", type=float, default=1.5,
+                        help="Which val guidance scale drives best-checkpoint "
+                             "selection (auto-added to --val_guidance_scales "
+                             "if absent).")
 
     # EMA
     parser.add_argument("--ema_decay", type=float, default=0.9999)
@@ -173,7 +202,10 @@ def parse_args():
     parser.add_argument("--master_addr", type=str, default="127.0.0.1")
     parser.add_argument("--master_port", type=str, default="29500")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.ckpt_guidance_scale not in args.val_guidance_scales:
+        args.val_guidance_scales.append(args.ckpt_guidance_scale)
+    return args
 
 
 def setup_distributed(rank, world_size, local_rank, backend="nccl"):
@@ -238,7 +270,8 @@ def visualize_flow_results(epoch, flow_matcher, device, condition, target, args,
     return metrics["SSIM"], metrics["PSNR"], metrics["LPIPS"]
 
 
-def validate_one_step(flow_matcher, device, condition, target, args, context=None):
+def validate_one_step(flow_matcher, device, condition, target, args, context=None,
+                      null_context=None, guidance_scale=1.0):
     """Sample once on a 3D patch, return SSIM/PSNR/LPIPS on central slice + the full generated patch."""
     flow_matcher.eval()
     with torch.no_grad():
@@ -247,6 +280,8 @@ def validate_one_step(flow_matcher, device, condition, target, args, context=Non
             num_steps=args.num_sampling_steps,
             device=device,
             context=context,
+            null_context=null_context,
+            guidance_scale=guidance_scale,
         )
 
     cz = condition.shape[-1] // 2
@@ -509,10 +544,13 @@ def train(local_rank, args):
 
             model.eval()
             context_encoder.eval()
+            ctx_module = context_encoder.module if args.distributed else context_encoder
 
-            val_ssim = 0
-            val_psnr = 0
-            val_lpips = 0
+            scales = args.val_guidance_scales
+            # Per-scale running sums of central-slice metrics.
+            sum_ssim = {s: 0.0 for s in scales}
+            sum_psnr = {s: 0.0 for s in scales}
+            sum_lpips = {s: 0.0 for s in scales}
             val_batches = 0
 
             # Cap validation at ~1000 images globally (split across ranks under DDP).
@@ -524,34 +562,41 @@ def train(local_rank, args):
                 target = target.to(device)
                 ctx_vec = ctx_vec.to(device)
                 ctx_emb = context_encoder(ctx_vec)
+                null_emb = ctx_module.null(ctx_emb.shape[0])
 
-                batch_ssim, batch_psnr, batch_lpips, generated = validate_one_step(
-                    flow_matcher=flow_matcher,
-                    device=device,
-                    condition=condition,
-                    target=target,
-                    args=args,
-                    context=ctx_emb,
-                )
+                gen_for_viz = {}
+                for s in scales:
+                    b_ssim, b_psnr, b_lpips, generated = validate_one_step(
+                        flow_matcher=flow_matcher,
+                        device=device,
+                        condition=condition,
+                        target=target,
+                        args=args,
+                        context=ctx_emb,
+                        null_context=null_emb,
+                        guidance_scale=s,
+                    )
+                    sum_ssim[s] += b_ssim
+                    sum_psnr[s] += b_psnr
+                    sum_lpips[s] += b_lpips
+                    if i == 0 and global_rank == 0:
+                        gen_for_viz[s] = generated
 
-                val_ssim += batch_ssim
-                val_psnr += batch_psnr
-                val_lpips += batch_lpips
                 val_batches += 1
                 val_images_seen += condition.shape[0]
 
                 if i == 0 and global_rank == 0:
                     cz = condition.shape[-1] // 2
-                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                    axes[0].imshow(condition[0, 0, :, :, cz].cpu().numpy(), cmap="gray")
-                    axes[0].set_title("Undersampled (input)")
-                    axes[0].axis("off")
-                    axes[1].imshow(generated[0, 0, :, :, cz].cpu().numpy(), cmap="gray")
-                    axes[1].set_title("Reconstructed")
-                    axes[1].axis("off")
-                    axes[2].imshow(target[0, 0, :, :, cz].cpu().numpy(), cmap="gray")
-                    axes[2].set_title("Ground truth")
-                    axes[2].axis("off")
+                    panels = [("Undersampled (input)", condition[0, 0, :, :, cz])]
+                    panels += [(f"cfg={s:g}", gen_for_viz[s][0, 0, :, :, cz])
+                               for s in scales]
+                    panels += [("Ground truth", target[0, 0, :, :, cz])]
+                    fig, axes = plt.subplots(1, len(panels),
+                                             figsize=(5 * len(panels), 5))
+                    for ax, (title, img) in zip(axes, panels):
+                        ax.imshow(img.cpu().numpy(), cmap="gray")
+                        ax.set_title(title)
+                        ax.axis("off")
                     plt.tight_layout()
                     plt.savefig(f"visualization_results/flow3d_epoch_{epoch}.png")
                     plt.close()
@@ -560,23 +605,31 @@ def train(local_rank, args):
                     break
 
             if args.distributed:
-                metrics_tensor = torch.tensor([val_ssim, val_psnr, val_lpips, val_batches], device=device)
+                flat = []
+                for s in scales:
+                    flat += [sum_ssim[s], sum_psnr[s], sum_lpips[s]]
+                flat.append(val_batches)
+                metrics_tensor = torch.tensor(flat, device=device)
                 dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-                val_ssim = metrics_tensor[0].item()
-                val_psnr = metrics_tensor[1].item()
-                val_lpips = metrics_tensor[2].item()
-                val_batches = metrics_tensor[3].item()
+                for j, s in enumerate(scales):
+                    sum_ssim[s] = metrics_tensor[3 * j].item()
+                    sum_psnr[s] = metrics_tensor[3 * j + 1].item()
+                    sum_lpips[s] = metrics_tensor[3 * j + 2].item()
+                val_batches = metrics_tensor[-1].item()
 
             val_batches = max(val_batches, 1)
-            avg_ssim = val_ssim / val_batches
-            avg_psnr = val_psnr / val_batches
-            avg_lpips = val_lpips / val_batches
+            avg_ssim = {s: sum_ssim[s] / val_batches for s in scales}
+            avg_psnr = {s: sum_psnr[s] / val_batches for s in scales}
+            avg_lpips = {s: sum_lpips[s] / val_batches for s in scales}
 
             if global_rank == 0:
-                print(f"Validation Metrics - SSIM: {avg_ssim:.4f}, PSNR: {avg_psnr:.4f}, LPIPS: {avg_lpips:.4f}")
+                for s in scales:
+                    print(f"Validation [cfg={s:g}] - SSIM: {avg_ssim[s]:.4f}, "
+                          f"PSNR: {avg_psnr[s]:.4f}, LPIPS: {avg_lpips[s]:.4f}")
 
+            ckpt_s = args.ckpt_guidance_scale
             if global_rank == 0 and args.save_model:
-                ssim_psnr = 0.7 * avg_ssim + 0.3 * avg_psnr
+                ssim_psnr = 0.7 * avg_ssim[ckpt_s] + 0.3 * avg_psnr[ckpt_s]
                 if ssim_psnr > best_ssim_psnr:
                     best_ssim_psnr = ssim_psnr
                     contrast_tag = "_".join(args.contrast)
@@ -584,17 +637,20 @@ def train(local_rank, args):
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
                     ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
                     torch.save({"model": model_sd, "context_encoder": ctx_sd}, checkpoint_path)
-                    print(f"Saved best model with Score: {ssim_psnr:.4f}")
+                    print(f"Saved best model (cfg={ckpt_s:g}) with Score: {ssim_psnr:.4f}")
 
             if args.log and global_rank == 0:
-                wandb.log({
+                log_dict = {
                     "epoch": epoch,
                     "train_loss": epoch_loss,
-                    "val_ssim": avg_ssim,
-                    "val_psnr": avg_psnr,
-                    "val_lpips": avg_lpips,
                     "lr": optimizer.param_groups[0]["lr"],
-                })
+                }
+                for s in scales:
+                    tag = f"cfg{s:g}"
+                    log_dict[f"val_ssim_{tag}"] = avg_ssim[s]
+                    log_dict[f"val_psnr_{tag}"] = avg_psnr[s]
+                    log_dict[f"val_lpips_{tag}"] = avg_lpips[s]
+                wandb.log(log_dict)
 
             if use_ema:
                 ema.restore()
