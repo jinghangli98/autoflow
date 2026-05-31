@@ -118,10 +118,15 @@ class FlowMatcher(nn.Module):
 
     @torch.no_grad()
     def sample(self, condition, num_steps=50, device="cuda", context=None,
-               null_context=None, guidance_scale=1.0):
-        """Euler ODE integration in 3D, with optional classifier-free guidance."""
+               null_context=None, guidance_scale=1.0, noise=None):
+        """Euler ODE integration in 3D, with optional classifier-free guidance.
+
+        `noise` is the initial state x(t=0). Pass a fixed tensor to compare
+        guidance scales under identical noise (so the difference reflects
+        context, not the random draw); if None a fresh sample is drawn.
+        """
         batch_size = condition.shape[0]
-        x = torch.randn_like(condition).to(device)
+        x = torch.randn_like(condition).to(device) if noise is None else noise.to(device)
         dt = 1.0 / num_steps
 
         for i in range(num_steps):
@@ -271,8 +276,12 @@ def visualize_flow_results(epoch, flow_matcher, device, condition, target, args,
 
 
 def validate_one_step(flow_matcher, device, condition, target, args, context=None,
-                      null_context=None, guidance_scale=1.0):
-    """Sample once on a 3D patch, return SSIM/PSNR/LPIPS on central slice + the full generated patch."""
+                      null_context=None, guidance_scale=1.0, noise=None):
+    """Sample once on a 3D patch, return SSIM/PSNR/LPIPS on central slice + the full generated patch.
+
+    `noise` (if given) is the shared initial state passed to `sample`, so
+    multiple guidance scales integrate from identical noise.
+    """
     flow_matcher.eval()
     with torch.no_grad():
         generated = flow_matcher.sample(
@@ -282,6 +291,7 @@ def validate_one_step(flow_matcher, device, condition, target, args, context=Non
             context=context,
             null_context=null_context,
             guidance_scale=guidance_scale,
+            noise=noise,
         )
 
     cz = condition.shape[-1] // 2
@@ -352,10 +362,10 @@ def train(local_rank, args):
         spatial_dims=3,
         in_channels=2,
         out_channels=1,
-        channels=(128, 256, 512),
+        channels=(64, 128, 256),
         attention_levels=(False, False, False),
         num_res_blocks=2,
-        num_head_channels=512,
+        num_head_channels=256,
         with_conditioning=True,
         cross_attention_dim=CONTEXT_OUTPUT_DIM,
     )
@@ -564,6 +574,11 @@ def train(local_rank, args):
                 ctx_emb = context_encoder(ctx_vec)
                 null_emb = ctx_module.null(ctx_emb.shape[0])
 
+                # Shared initial noise across guidance scales: any difference
+                # between cfg=0 (no context) and cfg>0 then reflects context,
+                # not the random draw.
+                shared_noise = torch.randn_like(condition)
+
                 gen_for_viz = {}
                 for s in scales:
                     b_ssim, b_psnr, b_lpips, generated = validate_one_step(
@@ -575,6 +590,7 @@ def train(local_rank, args):
                         context=ctx_emb,
                         null_context=null_emb,
                         guidance_scale=s,
+                        noise=shared_noise,
                     )
                     sum_ssim[s] += b_ssim
                     sum_psnr[s] += b_psnr
