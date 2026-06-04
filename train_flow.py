@@ -156,10 +156,13 @@ def parse_args():
     # Training
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--sample", type=float, default=10.0,
                         help="Percentage of (undersampled,GT) sample pairs to use")
+    parser.add_argument("--size", type=int, default=196,
+                        help="Patch size (in voxels). Actual patch shape is (size, size, 16) to ")
+
     parser.add_argument("--samples_per_contrast", type=int, default=None,
                         help="If set, each contrast contributes this many "
                              "training samples per epoch (0 = auto-balance to "
@@ -342,7 +345,7 @@ def train(local_rank, args):
             contrast=args.contrast,
             sample=args.sample,
             distributed=True, rank=global_rank, world_size=world_size,
-            num_workers=args.num_workers,
+            num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
             samples_per_contrast=args.samples_per_contrast,
         )
     else:
@@ -351,7 +354,7 @@ def train(local_rank, args):
             data_root=args.data_root,
             contrast=args.contrast,
             sample=args.sample,
-            num_workers=args.num_workers,
+            num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
             samples_per_contrast=args.samples_per_contrast,
         )
 

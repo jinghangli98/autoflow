@@ -15,7 +15,10 @@ Patch shapes on disk vary by orientation:
   coronal:  (192, 16, 192)
   sagittal: (16, 192, 192)
 All patches are transposed to (192, 192, 16) on load so the model sees a
-single canonical layout.
+single canonical layout, then center-cropped to the requested `patch_shape`
+(default (192, 192, 16), i.e. no crop). A smaller `patch_shape` such as
+(96, 96, 16) yields a genuine sub-volume at the same resolution -- useful for
+quick model debugging.
 """
 
 import glob
@@ -31,6 +34,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
+
+import torchio as tio
 
 
 _PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
@@ -89,11 +94,29 @@ def _index_subject_patches(subject_dir: str):
     return out
 
 
-def _load_patch(path: str, orientation: str = "axial") -> torch.Tensor:
-    """Load a NIfTI patch as float32 tensor (1, 192, 192, 16).
+def _center_crop(arr: np.ndarray, shape) -> np.ndarray:
+    """Center-crop a 3D array to `shape`.
+
+    No-op along any axis where the target size is >= the current size, so
+    `shape=(192, 192, 16)` on an already-(192, 192, 16) array returns it
+    unchanged.
+    """
+    slices = []
+    for cur, tgt in zip(arr.shape, shape):
+        if tgt >= cur:
+            slices.append(slice(None))
+        else:
+            start = (cur - tgt) // 2
+            slices.append(slice(start, start + tgt))
+    return arr[tuple(slices)]
+
+
+def _load_patch(path: str, orientation: str = "axial",
+                patch_shape=(196, 196, 16)) -> torch.Tensor:
+    """Load a NIfTI patch as float32 tensor (1, *patch_shape).
 
     On-disk shapes differ by orientation; we transpose so the slab (16) axis
-    is always last.
+    is always last, then center-crop to `patch_shape`.
     """
     arr = nib.load(path).get_fdata().astype(np.float32)
     if orientation == "coronal":
@@ -102,6 +125,7 @@ def _load_patch(path: str, orientation: str = "axial") -> torch.Tensor:
     elif orientation == "sagittal":
         # (16, 192, 192) -> (192, 192, 16)
         arr = np.moveaxis(arr, 0, -1)
+    arr = _center_crop(arr, patch_shape)
     return torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
 
 
@@ -140,17 +164,77 @@ def encode_context_vec(vx, vy, vz, tr, te, ti, fa):
     )
 
 
+def build_augmentation(
+    noise_std=(0.0, 0.1),
+    ghost_num=(2, 5),
+    ghost_intensity=(0.3, 0.7),
+    ghost_axes=(0, 1),
+    p_noise=0.5,
+    p_ghost=0.5,
+):
+    """Build a TorchIO transform that adds random MR noise + ghosting.
+
+    Operates on a single (C, W, H, D) float tensor (the canonical patch layout
+    here is (1, *patch_shape)) and returns one of the same shape. Intended to
+    be applied to the *condition* (undersampled input) only, so the GT target
+    stays a clean reconstruction goal.
+
+    Args:
+        noise_std: std range for `RandomNoise` (sigma ~ U(a, b)). Noise is in
+            the same intensity units as the patch, so keep this small relative
+            to your data's intensity range.
+        ghost_num: range for the number of ghosts (n ~ U(a, b)).
+        ghost_intensity: artifact-strength range relative to k-space max
+            (s ~ U(a, b)).
+        ghost_axes: spatial axis/axes (of W, H, D = 0, 1, 2) along which
+            ghosts may appear; one is chosen at random per sample. The slab
+            (D=2) axis is excluded by default since ghosting along a 16-slice
+            slab is rarely meaningful.
+        p_noise, p_ghost: per-sample probability of applying each transform.
+
+    Returns:
+        A `torchio.Transform` (Compose). Pass `None` for either probability's
+        transform to be skipped by setting the corresponding `p_*` to 0.
+    """
+    transforms = []
+    if p_noise > 0:
+        transforms.append(
+            tio.RandomNoise(mean=0.0, std=noise_std, p=p_noise)
+        )
+    if p_ghost > 0:
+        transforms.append(
+            tio.RandomGhosting(
+                num_ghosts=ghost_num,
+                axes=ghost_axes,
+                intensity=ghost_intensity,
+                p=p_ghost,
+            )
+        )
+    return tio.Compose(transforms) if transforms else None
+
+
 class PatchPairDataset(Dataset):
     """One sample = (undersampled patch, GT patch, context_vec).
 
-    Each volume tensor is shape (1, 192, 192, 16). `context_vec` is a (7,)
-    float32 tensor: (vx, vy, vz, log1p(TR), log1p(TE), log1p(TI), FA/180).
+    Each volume tensor is shape (1, *patch_shape) (default (1, 192, 192, 16)).
+    `context_vec` is a (7,) float32 tensor:
+    (vx, vy, vz, log1p(TR), log1p(TE), log1p(TI), FA/180).
+
+    `patch_shape` center-crops both the condition and target after they are
+    canonicalized to (192, 192, 16). Both members of a pair share the same
+    orientation and crop, so their spatial alignment is preserved.
+
+    `augment` is an optional TorchIO transform (see `build_augmentation`)
+    applied to the *condition only*. The GT target is never augmented so it
+    remains a clean reconstruction goal.
     """
 
-    def __init__(self, samples, gt_meta_by_subject, patch_shape=(192, 192, 16)):
+    def __init__(self, samples, gt_meta_by_subject, patch_shape=(192, 192, 16),
+                 augment=None):
         self.samples = samples
         self.gt_meta = gt_meta_by_subject
         self.patch_shape = patch_shape
+        self.augment = augment
 
     def __len__(self):
         return len(self.samples)
@@ -158,8 +242,11 @@ class PatchPairDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         orientation = s.get("orientation", "axial")
-        condition = _load_patch(s["condition_path"], orientation)
-        target = _load_patch(s["target_path"], orientation)
+        condition = _load_patch(s["condition_path"], orientation, self.patch_shape)
+        target = _load_patch(s["target_path"], orientation, self.patch_shape)
+
+        if self.augment is not None:
+            condition = self.augment(condition)
 
         ctx_vec = encode_context_vec(*self.gt_meta[s["gt_subject"]])
         return condition, target, ctx_vec
@@ -222,12 +309,20 @@ def _subsample(samples, percent: float, seed: int = 42):
     return rng.sample(samples, n)
 
 
-def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0):
+def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
+                           patch_shape=(192, 192, 16), augment=None):
     """Build train + val datasets for one or more contrasts.
 
     `contrast` may be a single string or a list/tuple of strings. When multiple
     contrasts are given, samples are concatenated and subject keys are
     namespaced as `<contrast>/<subject>` to avoid cross-contrast collisions.
+
+    `patch_shape` is forwarded to both datasets and center-crops each loaded
+    patch (default (192, 192, 16) = no crop). Use e.g. (96, 96, 16) for fast
+    debugging.
+
+    `augment` is an optional TorchIO transform (see `build_augmentation`)
+    applied to the *condition only*, on both the train and val datasets.
 
     The returned datasets carry a `contrast_indices` attribute mapping each
     contrast name to the list of dataset indices belonging to that contrast,
@@ -270,8 +365,10 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0):
         train_meta_all.update(tr_meta)
         val_meta_all.update(v_meta)
 
-    train_set = PatchPairDataset(train_samples_all, train_meta_all)
-    val_set = PatchPairDataset(val_samples_all, val_meta_all)
+    train_set = PatchPairDataset(train_samples_all, train_meta_all,
+                                 patch_shape=patch_shape, augment=augment)
+    val_set = PatchPairDataset(val_samples_all, val_meta_all,
+                               patch_shape=patch_shape, augment=augment)
     train_set.contrast_indices = train_contrast_indices
     val_set.contrast_indices = val_contrast_indices
     return train_set, val_set
@@ -352,10 +449,25 @@ def getloader_3d_patches(
     world_size: int = 1,
     train_shuffle: bool = True,
     samples_per_contrast=None,
+    patch_shape=(192, 192, 16),
+    augment=None,
+    augment_kwargs=None,
 ):
     """DataLoaders for 3D NIfTI patch reconstruction. DDP-aware.
 
     `contrast` may be a single string or a list/tuple of strings.
+
+    `patch_shape` center-crops each loaded patch after canonicalization to
+    (192, 192, 16). Default (192, 192, 16) = no crop; pass e.g. (96, 96, 16)
+    for fast model debugging.
+
+    Augmentation (random MR noise + ghosting) is applied to the *condition
+    only*, on both train and val:
+      - `augment`: pass a ready-made TorchIO transform to use it directly.
+      - `augment_kwargs`: pass a dict of `build_augmentation` kwargs (e.g.
+        `{"noise_std": (0, 0.05), "p_ghost": 0.3}`) to build one here.
+      - If both are None (default), no augmentation is applied.
+    `augment` takes precedence if both are given.
 
     If `samples_per_contrast` is not None, training uses
     `BalancedDistributedSampler`: each contrast contributes the same number of
@@ -363,7 +475,12 @@ def getloader_3d_patches(
     contrast(s) cycle through different random subsets across epochs.
     Validation always uses standard sampling.
     """
-    train_set, val_set = get_dataset_3d_patches(data_root, contrast, sample)
+    if augment is None and augment_kwargs is not None:
+        augment = build_augmentation(**augment_kwargs)
+
+    train_set, val_set = get_dataset_3d_patches(
+        data_root, contrast, sample, patch_shape, augment=augment
+    )
 
     use_balanced = samples_per_contrast is not None
 
@@ -421,7 +538,15 @@ if __name__ == "__main__":
     print(f"Building datasets for contrast={contrast} ...")
     train_loader, val_loader = getloader_3d_patches(
         batch_size=1, data_root=data_root, contrast=contrast,
-        sample=0.5, num_workers=0,
+        sample=0.5, num_workers=0, patch_shape=(96, 96, 16),
+        augment_kwargs={
+            "noise_std": (0.0, 0.05),
+            "ghost_num": (2, 5),
+            "ghost_intensity": (0.3, 0.7),
+            "ghost_axes": (0, 1),
+            "p_noise": 0.8,
+            "p_ghost": 0.8,
+        },
     )
     print(f"train batches: {len(train_loader)}, val batches: {len(val_loader)}")
 
