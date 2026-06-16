@@ -1,24 +1,38 @@
-"""3D NIfTI patch dataset for flow matching.
+"""3D NIfTI patch dataset for flow matching (multi-task restoration).
 
-Pairs undersampled patches (GRAPPA `_R{3..6}` / CS `_CS_R{2,3}`) with their
-matching ground-truth patches inside a single contrast (mprage or tse).
+Builds (condition, target, prompt) patch pairs for three restoration tasks
+inside a single acquisition:
+
+  1. artifact  -> raw (fully sampled, unprocessed) image
+  2. artifact  -> denoised + bias-corrected image
+  3. raw       -> denoised + bias-corrected image
+
+The *target's* text prompt is used as the cross-attention context, so the
+prompt tells the model which output to produce ("Fully sampled ..." vs
+"Denoised and biascorrected ...").
 
 Layout assumed:
-  <data_root>/<split>/<contrast>/<subject>[_<orient>]/patch_<x>_<y>_<z>.nii.gz
-where <subject> is the GT id (no suffix), `<orient>` is one of
-{coronal, sagittal} (omitted for axial), and siblings
-`<subject>_R<n>[_<orient>]` / `<subject>_CS_R<n>[_<orient>]` contain the same
-patch coordinates with the corresponding undersampling.
+  <data_root>/<split>/<anatomy>/<acquisition>/<subject>/patch_<x>_<y>_<z>.nii.gz
+where:
+  * <anatomy>      is one of {brain, knee, prostate}.
+  * <acquisition>  is a sequence/orientation/field folder, e.g. `mprage_ax_3T`,
+                   `pd_cor_1.5T`, `tse_ax_3T`.
+  * <subject>      is the *raw* (fully sampled, unprocessed) id, e.g. `2033AM`.
+                   Its prompt sidecar `<subject>.json` has `processing: raw`.
+  * `md<subject>`  is the denoised + bias-corrected counterpart; its sidecar
+                   `md<subject>.json` has `processing: denoised+biascorrected`.
+  * `<subject>_R<n>`, `<subject>_SPIKE_R<n>`,
+    `<subject>_ANISO_{phase,read,par}<n>` are the artifact siblings. They carry
+    the same patch coordinates but only a `patches_meta.json` (no prompt).
 
-Patch shapes on disk vary by orientation:
-  axial:    (192, 192, 16)
-  coronal:  (192, 16, 192)
-  sagittal: (16, 192, 192)
-All patches are transposed to (192, 192, 16) on load so the model sees a
-single canonical layout, then center-cropped to the requested `patch_shape`
-(default (192, 192, 16), i.e. no crop). A smaller `patch_shape` such as
-(96, 96, 16) yields a genuine sub-volume at the same resolution -- useful for
-quick model debugging.
+Only the raw and denoised dirs carry a `<dir>.json` prompt sidecar; artifact
+dirs do not. Each prompt sidecar stores the ready-made text under the `prompt`
+key (no more on-the-fly param-to-text rendering).
+
+All patches are stored canonical `(192, 192, 16)` on disk, so loading is a
+plain center-crop to the requested `patch_shape` (default no crop). A smaller
+`patch_shape` such as `(96, 96, 16)` yields a genuine sub-volume at the same
+resolution -- useful for quick model debugging.
 """
 
 import glob
@@ -27,7 +41,6 @@ import math
 import os
 import random
 import re
-from pathlib import Path
 
 import nibabel as nib
 import numpy as np
@@ -39,47 +52,13 @@ import torchio as tio
 
 
 _PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
-_UNDERSAMPLED_SUFFIX_RE = re.compile(r"_(?:CS_)?R\d+$")
-_ORIENTATIONS = ("coronal", "sagittal")
-
-
-def _parse_subject(name: str):
-    """Split a directory name into (base_subject, orientation).
-
-    `orientation` is one of {"axial", "coronal", "sagittal"}. The orientation
-    suffix (when present) comes *after* any undersampling suffix, e.g.
-    `1041_R3_coronal` -> base=`1041_R3`, orientation=`coronal`.
-    """
-    for orient in _ORIENTATIONS:
-        suffix = f"_{orient}"
-        if name.endswith(suffix):
-            return name[: -len(suffix)], orient
-    return name, "axial"
-
-
-def _is_gt_subject(name: str) -> bool:
-    """Return True if a subject directory name has no `_R*`/`_CS_R*` suffix."""
-    base, _ = _parse_subject(name)
-    return _UNDERSAMPLED_SUFFIX_RE.search(base) is None
-
-
-def _find_undersampled_siblings(contrast_dir: str, gt_name: str):
-    """Find sibling undersampled subject dirs for a given GT subject name.
-
-    Siblings share the GT's orientation suffix. For an axial GT `1041`,
-    matches `1041_R<n>` / `1041_CS_R<n>`. For `1041_coronal`, matches
-    `1041_R<n>_coronal` / `1041_CS_R<n>_coronal`.
-    """
-    base, orientation = _parse_subject(gt_name)
-    orient_suffix = "" if orientation == "axial" else f"_{orientation}"
-    pattern = re.compile(
-        rf"^{re.escape(base)}_(?:CS_)?R\d+{re.escape(orient_suffix)}$"
-    )
-    candidates = sorted(
-        d for d in os.listdir(contrast_dir)
-        if os.path.isdir(os.path.join(contrast_dir, d))
-    )
-    return [c for c in candidates if pattern.match(c)]
+# Artifact dir suffix appended to a raw subject id, e.g. `_R3`, `_SPIKE_R4`,
+# `_ANISO_phase3.5`, `_ANISO_read4`, `_ANISO_par3`.
+_ARTIFACT_SUFFIX_RE = re.compile(
+    r"_(?:R\d+|SPIKE_R\d+|ANISO_(?:phase|read|par)\d+(?:\.\d+)?)$"
+)
+_DENOISED_PREFIX = "md"
+_ANATOMIES = ("brain", "knee", "prostate")
 
 
 def _index_subject_patches(subject_dir: str):
@@ -111,57 +90,26 @@ def _center_crop(arr: np.ndarray, shape) -> np.ndarray:
     return arr[tuple(slices)]
 
 
-def _load_patch(path: str, orientation: str = "axial",
-                patch_shape=(196, 196, 16)) -> torch.Tensor:
-    """Load a NIfTI patch as float32 tensor (1, *patch_shape).
-
-    On-disk shapes differ by orientation; we transpose so the slab (16) axis
-    is always last, then center-crop to `patch_shape`.
-    """
+def _load_patch(path: str, patch_shape=(192, 192, 16)) -> torch.Tensor:
+    """Load a canonical (192, 192, 16) NIfTI patch as float32 (1, *patch_shape)."""
     arr = nib.load(path).get_fdata().astype(np.float32)
-    if orientation == "coronal":
-        # (192, 16, 192) -> (192, 192, 16)
-        arr = np.moveaxis(arr, 1, -1)
-    elif orientation == "sagittal":
-        # (16, 192, 192) -> (192, 192, 16)
-        arr = np.moveaxis(arr, 0, -1)
     arr = _center_crop(arr, patch_shape)
     return torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
 
 
-def _read_meta(subject_dir: str, subject_name: str):
-    """Read sequence params from <base_subject>_params.json.
+def _read_prompt(subject_dir: str, subject_name: str):
+    """Read (prompt, processing) from a subject's `<subject>.json` sidecar.
 
-    For oriented dirs (e.g. `1041_coronal/`), params still live under the
-    base id (`1041_params.json`). Returns
-    (vx, vy, vz, TR_s, TE_s, TI_s, FlipAngle_deg).
+    The newer datasets store the ready-made text prompt directly under the
+    `prompt` key; `processing` is one of {"raw", "denoised+biascorrected"}.
     """
-    base, _ = _parse_subject(subject_name)
-    params_path = os.path.join(subject_dir, f"{base}_params.json")
-    with open(params_path) as f:
+    with open(os.path.join(subject_dir, f"{subject_name}.json")) as f:
         meta = json.load(f)
-    vx, vy, vz = meta["voxel_size_mm"]
-    return (
-        float(vx), float(vy), float(vz),
-        float(meta["RepetitionTime"]),
-        float(meta["EchoTime"]),
-        float(meta["InversionTime"]),
-        float(meta["FlipAngle"]),
-    )
+    return meta["prompt"], meta.get("processing", "")
 
 
-def encode_context_vec(vx, vy, vz, tr, te, ti, fa):
-    """Build the 7-dim context vector with log1p TR/TE/TI and FA/180."""
-    return torch.tensor(
-        [
-            float(vx), float(vy), float(vz),
-            math.log1p(float(tr)),
-            math.log1p(float(te)),
-            math.log1p(float(ti)),
-            float(fa) / 180.0,
-        ],
-        dtype=torch.float32,
-    )
+def _has_prompt(subject_dir: str, subject_name: str) -> bool:
+    return os.path.exists(os.path.join(subject_dir, f"{subject_name}.json"))
 
 
 def build_augmentation(
@@ -176,8 +124,8 @@ def build_augmentation(
 
     Operates on a single (C, W, H, D) float tensor (the canonical patch layout
     here is (1, *patch_shape)) and returns one of the same shape. Intended to
-    be applied to the *condition* (undersampled input) only, so the GT target
-    stays a clean reconstruction goal.
+    be applied to the *condition* (input) only, so the target stays a clean
+    reconstruction goal.
 
     Args:
         noise_std: std range for `RandomNoise` (sigma ~ U(a, b)). Noise is in
@@ -214,25 +162,25 @@ def build_augmentation(
 
 
 class PatchPairDataset(Dataset):
-    """One sample = (undersampled patch, GT patch, context_vec).
+    """One sample = (condition patch, target patch, prompt).
 
     Each volume tensor is shape (1, *patch_shape) (default (1, 192, 192, 16)).
-    `context_vec` is a (7,) float32 tensor:
-    (vx, vy, vz, log1p(TR), log1p(TE), log1p(TI), FA/180).
+    `prompt` is the target's ready-made text description (see the sidecar
+    `prompt` key), e.g. "Fully sampled coronal 1.5T knee Proton Density MRI ..."
+    or "Denoised and biascorrected ...". Tokenization happens in the training
+    script, keeping this module free of any text-encoder dependency.
 
     `patch_shape` center-crops both the condition and target after they are
-    canonicalized to (192, 192, 16). Both members of a pair share the same
-    orientation and crop, so their spatial alignment is preserved.
+    loaded. Both members of a pair share the same patch coordinate so their
+    spatial alignment is preserved.
 
     `augment` is an optional TorchIO transform (see `build_augmentation`)
-    applied to the *condition only*. The GT target is never augmented so it
-    remains a clean reconstruction goal.
+    applied to the *condition only*. The target is never augmented so it
+    remains a clean restoration goal.
     """
 
-    def __init__(self, samples, gt_meta_by_subject, patch_shape=(192, 192, 16),
-                 augment=None):
+    def __init__(self, samples, patch_shape=(192, 192, 16), augment=None):
         self.samples = samples
-        self.gt_meta = gt_meta_by_subject
         self.patch_shape = patch_shape
         self.augment = augment
 
@@ -241,63 +189,118 @@ class PatchPairDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        orientation = s.get("orientation", "axial")
-        condition = _load_patch(s["condition_path"], orientation, self.patch_shape)
-        target = _load_patch(s["target_path"], orientation, self.patch_shape)
+        condition = _load_patch(s["condition_path"], self.patch_shape)
+        target = _load_patch(s["target_path"], self.patch_shape)
 
         if self.augment is not None:
             condition = self.augment(condition)
 
-        ctx_vec = encode_context_vec(*self.gt_meta[s["gt_subject"]])
-        return condition, target, ctx_vec
+        # target_type names the prompt capability this pair exercises:
+        # "raw" = "Fully sampled ..." target, "denoised" = "Denoised and
+        # biascorrected ..." target. Used by validation to score both equally.
+        target_type = "raw" if s["task"] == "artifact2raw" else "denoised"
+        return condition, target, s["prompt"], target_type
 
 
-def build_samples(data_root: str, split: str, contrast: str):
-    """Enumerate (undersampled, GT) patch pairs for one split + contrast.
+def _find_artifact_siblings(subjects, raw_name: str):
+    """Artifact dirs of `raw_name`: `<raw_name>_<artifact-suffix>`."""
+    out = []
+    for d in subjects:
+        if not d.startswith(raw_name):
+            continue
+        rest = d[len(raw_name):]
+        if _ARTIFACT_SUFFIX_RE.fullmatch(rest):
+            out.append(d)
+    return sorted(out)
+
+
+def build_samples(data_root: str, split: str, anatomy: str):
+    """Enumerate (condition, target, prompt) patch pairs for one anatomy.
+
+    Iterates every acquisition folder under `<data_root>/<split>/<anatomy>/`,
+    pairing each raw subject's artifact / raw / denoised patches across the
+    three restoration tasks (see module docstring).
 
     Returns:
-        samples:  list of dicts (see PatchPairDataset.__init__).
-        gt_meta:  dict gt_subject -> (vx, vy, vz, TR, TE, TI, FA).
+        samples: list of dicts {condition_path, target_path, prompt, task}.
     """
-    contrast_dir = os.path.join(data_root, split, contrast)
-    if not os.path.isdir(contrast_dir):
-        raise FileNotFoundError(f"Contrast directory not found: {contrast_dir}")
-
-    all_subjects = sorted(
-        d for d in os.listdir(contrast_dir)
-        if os.path.isdir(os.path.join(contrast_dir, d))
-    )
-    gt_subjects = [s for s in all_subjects if _is_gt_subject(s)]
+    anatomy_dir = os.path.join(data_root, split, anatomy)
+    if not os.path.isdir(anatomy_dir):
+        raise FileNotFoundError(f"Anatomy directory not found: {anatomy_dir}")
 
     samples = []
-    gt_meta = {}
-    for gt in gt_subjects:
-        gt_dir = os.path.join(contrast_dir, gt)
-        gt_patches = _index_subject_patches(gt_dir)
-        if not gt_patches:
-            continue
-        try:
-            gt_meta[gt] = _read_meta(gt_dir, gt)
-        except (FileNotFoundError, KeyError, TypeError):
-            # Skip subjects missing required sequence params.
-            continue
+    acquisitions = sorted(
+        d for d in os.listdir(anatomy_dir)
+        if os.path.isdir(os.path.join(anatomy_dir, d))
+    )
 
-        _, orientation = _parse_subject(gt)
-        siblings = _find_undersampled_siblings(contrast_dir, gt)
-        for sib in siblings:
-            sib_dir = os.path.join(contrast_dir, sib)
-            sib_patches = _index_subject_patches(sib_dir)
-            for (x, y, z), us_path in sib_patches.items():
-                if (x, y, z) not in gt_patches:
-                    continue
-                samples.append({
-                    "condition_path": us_path,
-                    "target_path": gt_patches[(x, y, z)],
-                    "gt_subject": gt,
-                    "orientation": orientation,
-                })
+    for acq in acquisitions:
+        acq_dir = os.path.join(anatomy_dir, acq)
+        subjects = sorted(
+            d for d in os.listdir(acq_dir)
+            if os.path.isdir(os.path.join(acq_dir, d))
+        )
+        subj_set = set(subjects)
 
-    return samples, gt_meta
+        for name in subjects:
+            sub_dir = os.path.join(acq_dir, name)
+            # Raw GT subjects own the pairing; skip denoised/artifact dirs here.
+            if name.startswith(_DENOISED_PREFIX) or not _has_prompt(sub_dir, name):
+                continue
+            try:
+                raw_prompt, processing = _read_prompt(sub_dir, name)
+            except (KeyError, json.JSONDecodeError):
+                continue
+            if processing != "raw":
+                continue
+
+            raw_patches = _index_subject_patches(sub_dir)
+            if not raw_patches:
+                continue
+
+            # Optional denoised + bias-corrected counterpart `md<subject>`.
+            den_name = f"{_DENOISED_PREFIX}{name}"
+            den_patches, den_prompt = {}, None
+            if den_name in subj_set:
+                den_dir = os.path.join(acq_dir, den_name)
+                if _has_prompt(den_dir, den_name):
+                    try:
+                        den_prompt, _ = _read_prompt(den_dir, den_name)
+                        den_patches = _index_subject_patches(den_dir)
+                    except (KeyError, json.JSONDecodeError):
+                        den_patches, den_prompt = {}, None
+
+            # Tasks 1 & 2: artifact -> raw, artifact -> denoised.
+            for art in _find_artifact_siblings(subjects, name):
+                art_patches = _index_subject_patches(os.path.join(acq_dir, art))
+                for coord, art_path in art_patches.items():
+                    if coord in raw_patches:
+                        samples.append({
+                            "condition_path": art_path,
+                            "target_path": raw_patches[coord],
+                            "prompt": raw_prompt,
+                            "task": "artifact2raw",
+                        })
+                    if den_prompt is not None and coord in den_patches:
+                        samples.append({
+                            "condition_path": art_path,
+                            "target_path": den_patches[coord],
+                            "prompt": den_prompt,
+                            "task": "artifact2denoised",
+                        })
+
+            # Task 3: raw -> denoised.
+            if den_prompt is not None:
+                for coord, raw_path in raw_patches.items():
+                    if coord in den_patches:
+                        samples.append({
+                            "condition_path": raw_path,
+                            "target_path": den_patches[coord],
+                            "prompt": den_prompt,
+                            "task": "raw2denoised",
+                        })
+
+    return samples
 
 
 def _subsample(samples, percent: float, seed: int = 42):
@@ -311,11 +314,10 @@ def _subsample(samples, percent: float, seed: int = 42):
 
 def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
                            patch_shape=(192, 192, 16), augment=None):
-    """Build train + val datasets for one or more contrasts.
+    """Build train + val datasets for one or more anatomies.
 
-    `contrast` may be a single string or a list/tuple of strings. When multiple
-    contrasts are given, samples are concatenated and subject keys are
-    namespaced as `<contrast>/<subject>` to avoid cross-contrast collisions.
+    `contrast` is the anatomy group (one of {brain, knee, prostate}) or a
+    list/tuple of them. When multiple are given, samples are concatenated.
 
     `patch_shape` is forwarded to both datasets and center-crops each loaded
     patch (default (192, 192, 16) = no crop). Use e.g. (96, 96, 16) for fast
@@ -325,33 +327,32 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
     applied to the *condition only*, on both the train and val datasets.
 
     The returned datasets carry a `contrast_indices` attribute mapping each
-    contrast name to the list of dataset indices belonging to that contrast,
-    so a balanced sampler can draw evenly across contrasts.
+    anatomy name to the list of dataset indices belonging to it, so a balanced
+    sampler can draw evenly across anatomies.
 
     Train comes from `train/`, validation from `test/`.
     """
     contrasts = [contrast] if isinstance(contrast, str) else list(contrast)
-    multi = len(contrasts) > 1
 
     train_samples_all, val_samples_all = [], []
-    train_meta_all = {}
-    val_meta_all = {}
     train_contrast_indices, val_contrast_indices = {}, {}
 
     for c in contrasts:
-        tr_samples, tr_meta = build_samples(data_root, "train", c)
-        v_samples, v_meta = build_samples(data_root, "test", c)
+        tr_samples = build_samples(data_root, "train", c)
+        v_samples = build_samples(data_root, "test", c)
+
+        for split_name, split_samples in (("train", tr_samples), ("test", v_samples)):
+            if not split_samples:
+                raise ValueError(
+                    f"No (condition, target) patch pairs found for anatomy "
+                    f"'{c}' in {os.path.join(data_root, split_name, c)}. Check "
+                    f"that raw subject dirs contain patch_*.nii.gz plus a "
+                    f"<subject>.json prompt sidecar, and that artifact "
+                    f"(_R*/_SPIKE_R*/_ANISO_*) and md<subject> dirs exist."
+                )
 
         tr_samples = _subsample(tr_samples, sample, seed=42)
         v_samples = _subsample(v_samples, min(sample, 5.0), seed=43)
-
-        if multi:
-            for s in tr_samples:
-                s["gt_subject"] = f"{c}/{s['gt_subject']}"
-            for s in v_samples:
-                s["gt_subject"] = f"{c}/{s['gt_subject']}"
-            tr_meta = {f"{c}/{k}": v for k, v in tr_meta.items()}
-            v_meta = {f"{c}/{k}": v for k, v in v_meta.items()}
 
         train_contrast_indices[c] = list(
             range(len(train_samples_all), len(train_samples_all) + len(tr_samples))
@@ -362,12 +363,10 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
 
         train_samples_all.extend(tr_samples)
         val_samples_all.extend(v_samples)
-        train_meta_all.update(tr_meta)
-        val_meta_all.update(v_meta)
 
-    train_set = PatchPairDataset(train_samples_all, train_meta_all,
+    train_set = PatchPairDataset(train_samples_all,
                                  patch_shape=patch_shape, augment=augment)
-    val_set = PatchPairDataset(val_samples_all, val_meta_all,
+    val_set = PatchPairDataset(val_samples_all,
                                patch_shape=patch_shape, augment=augment)
     train_set.contrast_indices = train_contrast_indices
     val_set.contrast_indices = val_contrast_indices
@@ -375,13 +374,13 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
 
 
 class BalancedDistributedSampler(Sampler):
-    """Yields an equal number of samples per contrast each epoch.
+    """Yields an equal number of samples per anatomy each epoch.
 
-    Each epoch reseeds via `seed + epoch`, so the larger contrast cycles
+    Each epoch reseeds via `seed + epoch`, so the larger anatomy cycles
     through different random subsets across epochs. Compatible with DDP via
     rank/num_replicas slicing (set `num_replicas=1, rank=0` for non-DDP).
 
-    If `samples_per_contrast` exceeds a contrast's pool, that contrast is
+    If `samples_per_contrast` exceeds an anatomy's pool, that anatomy is
     oversampled with replacement to reach the target.
     """
 
@@ -453,13 +452,13 @@ def getloader_3d_patches(
     augment=None,
     augment_kwargs=None,
 ):
-    """DataLoaders for 3D NIfTI patch reconstruction. DDP-aware.
+    """DataLoaders for 3D NIfTI patch restoration. DDP-aware.
 
-    `contrast` may be a single string or a list/tuple of strings.
+    `contrast` is the anatomy group (one of {brain, knee, prostate}) or a
+    list/tuple of them.
 
-    `patch_shape` center-crops each loaded patch after canonicalization to
-    (192, 192, 16). Default (192, 192, 16) = no crop; pass e.g. (96, 96, 16)
-    for fast model debugging.
+    `patch_shape` center-crops each loaded patch (default (192, 192, 16) = no
+    crop; pass e.g. (96, 96, 16) for fast model debugging).
 
     Augmentation (random MR noise + ghosting) is applied to the *condition
     only*, on both train and val:
@@ -470,9 +469,9 @@ def getloader_3d_patches(
     `augment` takes precedence if both are given.
 
     If `samples_per_contrast` is not None, training uses
-    `BalancedDistributedSampler`: each contrast contributes the same number of
-    samples per epoch (0 = auto-balance to the smallest contrast). The larger
-    contrast(s) cycle through different random subsets across epochs.
+    `BalancedDistributedSampler`: each anatomy contributes the same number of
+    samples per epoch (0 = auto-balance to the smallest anatomy). The larger
+    anatomy/anatomies cycle through different random subsets across epochs.
     Validation always uses standard sampling.
     """
     if augment is None and augment_kwargs is not None:
@@ -531,32 +530,31 @@ def getloader_3d_patches(
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    from collections import Counter
 
-    data_root = "/home/rflab/jil202/grappa-recon/dataset_grappa_nii"
-    contrast = "mprage"
+    data_root = "/vast/tibrahim/jil202/data"
+    anatomy = "knee"
 
-    print(f"Building datasets for contrast={contrast} ...")
-    train_loader, val_loader = getloader_3d_patches(
-        batch_size=1, data_root=data_root, contrast=contrast,
-        sample=0.5, num_workers=0, patch_shape=(96, 96, 16),
-        augment_kwargs={
-            "noise_std": (0.0, 0.05),
-            "ghost_num": (2, 5),
-            "ghost_intensity": (0.3, 0.7),
-            "ghost_axes": (0, 1),
-            "p_noise": 0.8,
-            "p_ghost": 0.8,
-        },
+    print(f"Building datasets for anatomy={anatomy} ...")
+    train_set, val_set = get_dataset_3d_patches(
+        data_root, anatomy, sample=100.0, patch_shape=(192, 192, 16),
     )
-    print(f"train batches: {len(train_loader)}, val batches: {len(val_loader)}")
+    task_counts = Counter(s["task"] for s in train_set.samples)
+    print(f"train pairs: {len(train_set)}, val pairs: {len(val_set)}")
+    print(f"train task breakdown: {dict(task_counts)}")
 
-    for condition, target, ctx_vec in train_loader:
+    train_loader, _ = getloader_3d_patches(
+        batch_size=1, data_root=data_root, contrast=anatomy,
+        sample=1.0, num_workers=0, patch_shape=(96, 96, 16),
+    )
+    for condition, target, prompts, target_types in train_loader:
         print(
             f"condition  {tuple(condition.shape)}  range "
             f"[{condition.min():.4f}, {condition.max():.4f}]\n"
             f"target     {tuple(target.shape)}  range "
             f"[{target.min():.4f}, {target.max():.4f}]\n"
-            f"ctx_vec    {tuple(ctx_vec.shape)}  values {ctx_vec.tolist()}"
+            f"target_type {target_types[0]!r}\n"
+            f"prompt     {prompts[0]!r}"
         )
         c = condition[0, 0, :, :, condition.shape[-1] // 2].cpu().numpy()
         t = target[0, 0, :, :, target.shape[-1] // 2].cpu().numpy()

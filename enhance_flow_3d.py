@@ -4,38 +4,40 @@ Loads one .nii.gz, normalizes [0, 255] -> [0, 1], pads X/Y/Z to multiples of 16,
 slides 32-thick chunks along Z with full XY in one shot per chunk, runs flow
 matching, stitches along Z with overlap-and-add blending, unpads, and saves.
 
-Sequence parameters (TR/TE/TI/FlipAngle) must be supplied either via CLI flags
-or a sidecar JSON (`--params_json`). Voxel size is read from the NIfTI header
-unless overridden via `--voxel_size`.
+The cross-attention context is the *target* text prompt -- it selects which
+output the multi-task model produces. Supply it directly with `--prompt` or via
+`--prompt_json` (a sidecar with a `prompt` key, matching the dataset's JSON
+sidecars). It is encoded by the frozen RadBERT text encoder, exactly as during
+training. Examples:
+    "Fully sampled axial 7T brain T2-weighted FLAIR MRI of resolution 0.85 x 0.75 x 1.5 mm."
+    "Denoised and biascorrected coronal 1.5T knee Proton Density MRI of resolution 0.44 x 0.44 x 3 mm."
 
 Classifier-free guidance is enabled with `--guidance_scale > 1.0`. Each ODE
-step then runs two forwards: conditional + unconditional (learnable null), and
-mixes them as `v_uncond + scale * (v_cond - v_uncond)`.
+step then runs two forwards: conditional + unconditional (encoded empty
+prompt), and mixes them as `v_uncond + scale * (v_cond - v_uncond)`.
 
-/ix1/tibrahim/jil202/studies/ACE/sub-ACE_PI0001_01/T2w/sub-ACE_PI0001_01_T2w.nii.gz
-/ix1/tibrahim/jil202/studies/ACE/sub-ACE_PI0001_01/FLAIR/sub-ACE_PI0001_01_FLAIR.nii.gz   
-/ix1/tibrahim/jil202/studies/ACE/sub-ACE_PI0001_01/T1w/sub-ACE_PI0001_01_MP2RAGE_denoised.nii.gz  
 Usage:
+    # artifact -> fully sampled (raw)
     python enhance_flow_3d.py \
-        --checkpoint_path checkpoints/flow_matching_3d_mprage_mp2rage_flair_tse_swi_best_epoch_19.pt \
-        --input_path /ix1/tibrahim/jil202/autoflow/test_images/mp2rage/MB092_R5.nii.gz    \
-        --output_path ./outputs/T1wMP2RAGE_R5.nii.gz \
-        --tr 3.0 --te 0.00196 --ti 1.2 --flip_angle 8 \
-        --num_sampling_steps 1 --euler --fp16 --non_overlap 16 \
-        --guidance_scale 0 --compile --ras --autocrop --scale
+        --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints/flow_matching_3d_multitask.pt \
+        --input_path flair.nii.gz   \
+        --output_path ./outputs/flair_spike_R3.nii.gz \
+        --prompt "Fully sampled axial 7T brain T2-weighted FLAIR MRI of resolution 0.85 x 0.75 x 1.5 mm." \
+        --num_sampling_steps 1 --euler --fp16 --non_overlap 8 \
+        --guidance_scale 1.5 --compile --planes axial --ras --autocrop
 
+    # raw (or artifact) -> denoised + bias-corrected, prompt read from a sidecar
     python enhance_flow_3d.py \
-        --checkpoint_path checkpoints/flow_matching_3d_mprage_mp2rage_flair_tse_swi_best_epoch_11.pt \
+        --checkpoint_path checkpoints/flow_matching_3d_multitask.pt \
         --input_path 3T.nii.gz \
-        --output_path ./outputs/3T_RAS.nii.gz \
-        --tr 3.0 --te 0.00196 --ti 1.2 --flip_angle 8 \
+        --output_path ./outputs/3T_denoised.nii.gz \
+        --prompt_json /vast/tibrahim/jil202/data/test/brain/mprage_ax_3T/mde14089s3_P53248.7/mde14089s3_P53248.7.json \
         --num_sampling_steps 1 --euler --fp16 --non_overlap 16 \
         --guidance_scale 0 --rescale --compile --ras
 """
 
 import argparse
 import json
-import math
 import os
 
 import nibabel as nib
@@ -46,37 +48,11 @@ import torch.nn.functional as F
 from monai.networks.nets import DiffusionModelUNet
 from tqdm import tqdm
 
+from train_flow import TextConditioner
 
-PATCH_Z = 32
+
+PATCH_Z = 16
 PAD_MULT = 16
-CONTEXT_INPUT_DIM = 7
-CONTEXT_HIDDEN_DIM = 128
-CONTEXT_OUTPUT_DIM = 256
-
-
-class ContextEncoder(nn.Module):
-    """Mirror of training-time ContextEncoder, with learnable null embedding."""
-
-    def __init__(self, in_dim=CONTEXT_INPUT_DIM, hidden_dim=CONTEXT_HIDDEN_DIM,
-                 out_dim=CONTEXT_OUTPUT_DIM):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.null_emb = nn.Parameter(torch.zeros(1, 1, out_dim))
-
-    def forward(self, ctx_vec):
-        return self.net(ctx_vec).unsqueeze(1)
-
-    def null(self, batch_size: int):
-        return self.null_emb.expand(batch_size, -1, -1)
-
-
-def voxel_size_from_nii(img):
-    z = img.header.get_zooms()
-    return float(z[0]), float(z[1]), float(z[2])
 
 
 def to_ras(img):
@@ -92,9 +68,9 @@ def to_ras(img):
 class FlowMatcher(nn.Module):
     """3D Flow Matching wrapper for inference (Euler / Heun / RK4) with CFG.
 
-    `null_context` is the learnable unconditional embedding. When
-    `guidance_scale != 1.0` and `null_context` is provided, each velocity eval
-    runs two forwards (conditional + unconditional) and combines them as
+    `null_context` is the unconditional embedding (the encoded empty prompt).
+    When `guidance_scale != 1.0` and `null_context` is provided, each velocity
+    eval runs two forwards (conditional + unconditional) and combines them as
     `v = v_uncond + scale * (v_cond - v_uncond)`.
     """
 
@@ -191,18 +167,17 @@ def make_blend_window(patch_z, non_overlap, dtype=torch.float32):
     return w
 
 
-def build_context_emb(context_encoder, voxel, tr, te, ti, fa, device, dtype):
-    ctx_vec = torch.tensor(
-        [
-            voxel[0], voxel[1], voxel[2],
-            math.log1p(tr), math.log1p(te), math.log1p(ti),
-            fa / 180.0,
-        ],
-        device=device, dtype=dtype,
-    ).unsqueeze(0)
+def build_context_emb(text_conditioner, prompt, device, dtype):
+    """Encode the target text prompt -> (cond, null) embeddings.
+
+    The prompt is the target description (e.g. "Fully sampled ..." or "Denoised
+    and biascorrected ...") and is shared across planes. The RadBERT encoder
+    runs in fp32; only the output embeddings are cast to `dtype`.
+    """
+    print(f"  prompt: {prompt!r}")
     with torch.no_grad():
-        ctx_emb = context_encoder(ctx_vec)
-        null_emb = context_encoder.null(1).to(dtype=dtype)
+        ctx_emb = text_conditioner.encode([prompt], device).to(dtype=dtype)
+        null_emb = text_conditioner.null(1).to(dtype=dtype)
     return ctx_emb, null_emb
 
 
@@ -270,24 +245,22 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
     return output_sum / output_weight.clamp(min=1e-8), len(chunk_starts)
 
 
-def run_plane_inference(vol_t, plane, voxel, ctx_args, context_encoder,
-                        sampler, args, device, ctx_dtype,
+def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
+                        sampler, args, device,
                         snapshot_idx=None, snapshot_path=None):
     """Permute (X, Y, Z) volume so `plane`'s slab axis is last, run slab
-    inference, then permute back to (X, Y, Z)."""
+    inference, then permute back to (X, Y, Z).
+
+    `ctx_emb`/`null_emb` are shared across planes: training built the prompt
+    from the params JSON's voxel order regardless of patch orientation.
+    """
     perm, inv_perm = PLANE_PERMS[plane]
     permuted = vol_t.permute(*perm).contiguous()
-    voxel_perm = tuple(voxel[i] for i in perm)
-
-    tr, te, ti, fa = ctx_args
-    ctx_emb, null_emb = build_context_emb(
-        context_encoder, voxel_perm, tr, te, ti, fa, device, ctx_dtype,
-    )
 
     padded, pad_info, original_shape = pad_to_multiple(permuted, PAD_MULT, min_z=PATCH_Z)
     non_overlap = max(0, args.non_overlap)
     print(f"  [{plane}] permuted shape={tuple(permuted.shape)}, "
-          f"padded shape={tuple(padded.shape)}, voxel_perm={voxel_perm}")
+          f"padded shape={tuple(padded.shape)}")
 
     output_padded, n_chunks = slab_inference(
         padded, sampler, args.num_sampling_steps, device,
@@ -424,16 +397,15 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
 
-    p.add_argument("--voxel_size", type=float, nargs=3, default=None,
-                   metavar=("X", "Y", "Z"),
-                   help="Override voxel size (mm). Default: read from NIfTI header.")
-    p.add_argument("--params_json", type=str, default=None,
-                   help="Sidecar JSON with RepetitionTime/EchoTime/InversionTime/"
-                        "FlipAngle (and optional voxel_size_mm). CLI flags override.")
-    p.add_argument("--tr", type=float, default=None, help="Repetition time (seconds)")
-    p.add_argument("--te", type=float, default=None, help="Echo time (seconds)")
-    p.add_argument("--ti", type=float, default=None, help="Inversion time (seconds)")
-    p.add_argument("--flip_angle", type=float, default=None, help="Flip angle (degrees)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt", type=str, default=None,
+                   help="Target text prompt (the cross-attention context that "
+                        "selects the output), e.g. \"Fully sampled axial 7T "
+                        "brain T2-weighted FLAIR MRI of resolution 0.85 x 0.75 "
+                        "x 1.5 mm.\" or \"Denoised and biascorrected ...\".")
+    g.add_argument("--prompt_json", type=str, default=None,
+                   help="Sidecar JSON with a `prompt` key (the dataset's "
+                        "<subject>.json format) to read the target prompt from.")
 
     # Classifier-free guidance
     p.add_argument("--guidance_scale", type=float, default=1.5,
@@ -473,43 +445,47 @@ def parse_args():
 
 
 def load_model(checkpoint_path, device, args):
+    text_conditioner = TextConditioner()
     model = DiffusionModelUNet(
         spatial_dims=3,
         in_channels=2,
         out_channels=1,
         channels=(128, 256, 512),
-        attention_levels=(False, False, False),
+        attention_levels=(False, False, True),
         num_res_blocks=2,
         num_head_channels=512,
         with_conditioning=True,
-        cross_attention_dim=CONTEXT_OUTPUT_DIM,
+        cross_attention_dim=text_conditioner.hidden_size,
     )
-    context_encoder = ContextEncoder()
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if not (isinstance(ckpt, dict) and "model" in ckpt):
         raise ValueError(
-            f"Checkpoint at {checkpoint_path} does not contain 'model' / 'context_encoder' "
-            f"keys. Re-train with the context-aware train_flow.py."
+            f"Checkpoint at {checkpoint_path} does not contain a 'model' key. "
+            f"Re-train with the text-conditioned train_flow.py."
+        )
+    if "context_encoder" in ckpt:
+        raise ValueError(
+            f"Checkpoint at {checkpoint_path} is from the legacy scalar-context "
+            f"model (cross_attention_dim=256); it is incompatible with the "
+            f"RadBERT text-conditioned model (cross_attention_dim="
+            f"{text_conditioner.hidden_size}). Re-train with the current "
+            f"train_flow.py or use the old enhance_flow_3d.py from git history."
         )
 
     model_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
     model.load_state_dict(model_sd)
-    if "context_encoder" in ckpt:
-        ctx_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v
-                  for k, v in ckpt["context_encoder"].items()}
-        context_encoder.load_state_dict(ctx_sd)
 
     model.to(device).eval()
-    context_encoder.to(device).eval()
+    # RadBERT stays fp32; its output embeddings are cast in build_context_emb.
+    text_conditioner.to(device)
 
     if args.fp16:
         model = model.half()
-        context_encoder = context_encoder.half()
     if args.compile:
         model = torch.compile(model, backend="inductor")
 
-    return model, context_encoder
+    return model, text_conditioner
 
 
 def pad_to_multiple(volume: torch.Tensor, mult: int, min_z: int = 0):
@@ -537,42 +513,17 @@ def unpad(volume: torch.Tensor, pad_info, original_shape):
     return volume[x_l:x_l + ox, y_l:y_l + oy, z_l:z_l + oz]
 
 
-def resolve_context(args, img):
-    """Build (vx, vy, vz, TR, TE, TI, FlipAngle).
-
-    Voxel size: --voxel_size > params_json["voxel_size_mm"] > NIfTI header.
-    Sequence params: CLI flag > params_json. Missing required fields raise.
-    """
-    sidecar = {}
-    if args.params_json is not None:
-        with open(args.params_json) as f:
-            sidecar = json.load(f)
-
-    if args.voxel_size is not None:
-        voxel = (float(args.voxel_size[0]),
-                 float(args.voxel_size[1]),
-                 float(args.voxel_size[2]))
-    elif "voxel_size_mm" in sidecar:
-        vx, vy, vz = sidecar["voxel_size_mm"]
-        voxel = (float(vx), float(vy), float(vz))
-    else:
-        voxel = voxel_size_from_nii(img)
-
-    def _resolve(cli_value, sidecar_key, friendly_name):
-        if cli_value is not None:
-            return float(cli_value)
-        if sidecar_key in sidecar and sidecar[sidecar_key] is not None:
-            return float(sidecar[sidecar_key])
+def resolve_prompt(args):
+    """Return the target prompt from --prompt or the `prompt` key of --prompt_json."""
+    if args.prompt is not None:
+        return args.prompt
+    with open(args.prompt_json) as f:
+        meta = json.load(f)
+    if "prompt" not in meta:
         raise ValueError(
-            f"{friendly_name} is required: pass via CLI or in --params_json "
-            f"(key '{sidecar_key}')."
+            f"--prompt_json {args.prompt_json} has no 'prompt' key."
         )
-
-    tr = _resolve(args.tr, "RepetitionTime", "TR")
-    te = _resolve(args.te, "EchoTime", "TE")
-    ti = _resolve(args.ti, "InversionTime", "TI")
-    fa = _resolve(args.flip_angle, "FlipAngle", "FlipAngle")
-    return voxel, tr, te, ti, fa
+    return meta["prompt"]
 
 
 def main():
@@ -584,7 +535,7 @@ def main():
     print(f"Using device: {device}")
 
     print(f"Loading checkpoint: {args.checkpoint_path}")
-    model, context_encoder = load_model(args.checkpoint_path, device, args)
+    model, text_conditioner = load_model(args.checkpoint_path, device, args)
     flow = FlowMatcher(model, sigma_min=args.sigma_min)
 
     print(f"Loading input: {args.input_path}")
@@ -617,10 +568,13 @@ def main():
         raw = img.get_fdata().astype(np.float32)
     print(f"  raw shape={raw.shape}, range=[{raw.min():.2f}, {raw.max():.2f}]")
 
-    voxel, tr, te, ti, fa = resolve_context(args, img)
+    prompt = resolve_prompt(args)
     ctx_dtype = torch.float16 if args.fp16 else torch.float32
-    print(f"  voxel={voxel}, TR={tr}s, TE={te}s, TI={ti}s, FA={fa}deg, "
-          f"guidance_scale={args.guidance_scale}")
+    print(f"  guidance_scale={args.guidance_scale}")
+
+    ctx_emb, null_emb = build_context_emb(
+        text_conditioner, prompt, device, ctx_dtype,
+    )
 
     non_overlap = max(0, args.non_overlap)
     if non_overlap >= PATCH_Z:
@@ -657,7 +611,6 @@ def main():
             output_basename = output_basename[: -len(ext)]
             break
 
-    ctx_args = (tr, te, ti, fa)
     plane_outputs = []
     for plane in args.planes:
         plane_snapshot_path = None
@@ -667,8 +620,8 @@ def main():
                 f"{output_basename}_{plane}_slab{args.snapshot_slab}.png",
             )
         plane_out = run_plane_inference(
-            vol_t, plane, voxel, ctx_args, context_encoder,
-            sampler, args, device, ctx_dtype,
+            vol_t, plane, ctx_emb, null_emb,
+            sampler, args, device,
             snapshot_idx=snapshot_idx,
             snapshot_path=plane_snapshot_path,
         )

@@ -28,25 +28,42 @@ def calculate_nmse(enhanced_img, reference_img):
             nmse_values.append(nmse)
     return np.mean(nmse_values)
 
+_LPIPS_MODEL = None
+
+
+def _get_lpips_model():
+    """Lazily build and cache one VGG-LPIPS model (per process).
+
+    Reused across calls so validation doesn't reload VGG weights on every
+    batch/scale/target-type evaluation.
+    """
+    global _LPIPS_MODEL
+    if _LPIPS_MODEL is None:
+        _LPIPS_MODEL = lpips.LPIPS(net='vgg')
+        if torch.cuda.is_available():
+            _LPIPS_MODEL = _LPIPS_MODEL.cuda()
+    return _LPIPS_MODEL
+
+
 def calculate_lpips(generated, target):
     """Compute LPIPS distance for each image in the batch and average."""
-    loss_fn = lpips.LPIPS(net='vgg')  # Initialize once for efficiency in actual use
-    
+    loss_fn = _get_lpips_model()
+
     # Reshape from [batch, frames, H, W] to [batch*frames, H, W]
     batch_size, num_frames = generated.shape[:2]
     generated_flat = generated.reshape(-1, generated.shape[-2], generated.shape[-1])
     target_flat = target.reshape(-1, target.shape[-2], target.shape[-1])
-    
+
     # Convert to tensors and add channel dimension, then repeat to get 3 channels for VGG
     generated_tensor = torch.from_numpy(generated_flat).float().unsqueeze(1).repeat(1, 3, 1, 1)
     target_tensor = torch.from_numpy(target_flat).float().unsqueeze(1).repeat(1, 3, 1, 1)
-    
+
     if torch.cuda.is_available():
         generated_tensor = generated_tensor.cuda()
         target_tensor = target_tensor.cuda()
-        loss_fn.cuda()
-    
-    lpips_scores = loss_fn(generated_tensor, target_tensor)
+
+    with torch.no_grad():
+        lpips_scores = loss_fn(generated_tensor, target_tensor)
     return lpips_scores.mean().item()
 
 def calculate_ssim(generated, target):

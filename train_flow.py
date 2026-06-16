@@ -1,17 +1,26 @@
 """3D NIfTI Flow Matching Training Script.
 
-Conditional flow matching for accelerated MRI reconstruction. The model takes
-an undersampled 3D patch (`condition`) and predicts the velocity field that
-maps noise to the GT patch.
+Conditional flow matching for multi-task MRI restoration. The model takes a
+3D patch (`condition` -- an artifact patch or the raw fully-sampled patch) and
+predicts the velocity field that maps noise to the target patch (raw, or
+denoised + bias-corrected). The three pairings are artifact->raw,
+artifact->denoised, and raw->denoised (see `dataset.build_samples`).
 
 Inputs are 5D tensors `(B, 1, X, Y, Z)`. The model concatenates
 `(noisy_target, condition)` along the channel dim -> `(B, 2, X, Y, Z)` and
 predicts a velocity field of shape `(B, 1, X, Y, Z)`.
 
+The target's text prompt is injected via cross-attention so it tells the model
+which output to produce ("Fully sampled ..." vs "Denoised and biascorrected
+..."). The dataset reads the ready-made prompt from each target's JSON sidecar
+(`prompt` key); a frozen RadBERT (`zzxslp/RadBERT-RoBERTa-4m`, RoBERTa-base,
+hidden 768) encodes it into a `(B, seq_len, 768)` context. Classifier-free
+guidance uses the encoded empty prompt as the unconditional signal.
+
 Usage:
     python -m torch.distributed.run --nproc_per_node=8 train_flow.py \
-        --contrast mprage \
-        --data_root /ix1/tibrahim/jil202/studies/dataset_grappa_nii \
+        --contrast brain knee prostate \
+        --data_root /vast/tibrahim/jil202/data \
         --distributed --fp16 --save_model --compile \
         --batch_size 4 --max_epochs 100 --sample 100 \
         --num_sampling_steps 2
@@ -30,39 +39,84 @@ from monai.networks.nets import DiffusionModelUNet
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
 
 import wandb
 from metrics import evaluate_image_quality
 from utils import EMA
 
 
-CONTEXT_INPUT_DIM = 7      # (vx, vy, vz, log1p(TR), log1p(TE), log1p(TI), FA/180)
-CONTEXT_HIDDEN_DIM = 128
-CONTEXT_OUTPUT_DIM = 256   # must match cross_attention_dim on the UNet
+TEXT_ENCODER_NAME = "zzxslp/RadBERT-RoBERTa-4m"
+PROMPT_MAX_LEN = 64        # prompts tokenize to ~50 tokens; padded to this
+
+# Target types the validation scores separately so each prompt capability
+# counts equally: "raw" = "Fully sampled ..." outputs, "denoised" = "Denoised
+# and biascorrected ..." outputs.
+TARGET_TYPES = ("raw", "denoised")
+PSNR_SCORE_NORM = 40.0     # dB mapping to a full PSNR score contribution of 1.0
 
 
-class ContextEncoder(nn.Module):
-    """Encode (B, in_dim) raw scalar context into (B, 1, out_dim) for cross-attention.
+def selection_score(ssim, psnr, lpips):
+    """Balanced higher-is-better checkpoint score in ~[0, 1].
 
-    Carries a learnable null embedding used as the unconditional signal for
-    classifier-free guidance.
+    SSIM (higher better, ~[0, 1]), PSNR (higher better, normalized by
+    PSNR_SCORE_NORM dB and capped at 1), and LPIPS (lower better, folded in as
+    1 - LPIPS) each contribute one third, so none drowns out the others (the
+    old 0.7*SSIM + 0.3*PSNR score was dominated by raw PSNR magnitude).
+    """
+    psnr_term = 1.0 if not np.isfinite(psnr) else min(psnr / PSNR_SCORE_NORM, 1.0)
+    return (ssim + psnr_term + (1.0 - lpips)) / 3.0
+
+
+class TextConditioner(nn.Module):
+    """Frozen RadBERT text encoder -> (B, seq_len, hidden) cross-attention context.
+
+    Fully frozen: no trainable params, so it stays out of the optimizer, EMA,
+    DDP, and checkpoints. The unconditional signal for classifier-free
+    guidance is the encoded *empty prompt* (as in generative_brain_controlnet,
+    which swaps in BOS+PAD tokens): during training, dropped samples have
+    their token ids replaced with the empty-prompt ids before encoding, and
+    `null()` returns the empty-prompt embedding for guided sampling.
     """
 
-    def __init__(self, in_dim=CONTEXT_INPUT_DIM, hidden_dim=CONTEXT_HIDDEN_DIM,
-                 out_dim=CONTEXT_OUTPUT_DIM):
+    def __init__(self, model_name=TEXT_ENCODER_NAME, max_len=PROMPT_MAX_LEN):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.encoder = AutoModel.from_pretrained(model_name)
+        self.encoder.requires_grad_(False)
+        self.encoder.eval()
+        self.max_len = max_len
+        self.hidden_size = self.encoder.config.hidden_size
+
+        null_tok = self.tokenizer(
+            "", padding="max_length", max_length=max_len, return_tensors="pt",
         )
-        self.null_emb = nn.Parameter(torch.zeros(1, 1, out_dim))
+        self.register_buffer("null_ids", null_tok.input_ids, persistent=False)
+        self.register_buffer("null_mask", null_tok.attention_mask, persistent=False)
 
-    def forward(self, ctx_vec):
-        return self.net(ctx_vec).unsqueeze(1)
+    def train(self, mode=True):
+        # Always stay in eval mode so the encoder's dropout never activates.
+        return super().train(False)
 
+    @torch.no_grad()
+    def encode(self, prompts, device, cfg_dropout_prob=0.0):
+        tok = self.tokenizer(
+            list(prompts), padding="max_length", max_length=self.max_len,
+            truncation=True, return_tensors="pt",
+        )
+        ids = tok.input_ids.to(device)
+        mask = tok.attention_mask.to(device)
+        if cfg_dropout_prob > 0:
+            drop = torch.rand(ids.shape[0], device=device) < cfg_dropout_prob
+            ids = torch.where(drop[:, None], self.null_ids, ids)
+            mask = torch.where(drop[:, None], self.null_mask, mask)
+        return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+
+    @torch.no_grad()
     def null(self, batch_size: int):
-        return self.null_emb.expand(batch_size, -1, -1)
+        ids = self.null_ids.expand(batch_size, -1)
+        mask = self.null_mask.expand(batch_size, -1)
+        return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
 
 
 class FlowMatcher(nn.Module):
@@ -146,12 +200,15 @@ def parse_args():
 
     # Data
     parser.add_argument("--data_root", type=str,
-                        default="/home/rflab/jil202/grappa-recon/dataset_grappa_nii",
-                        help="Root containing train/<contrast>/ and test/<contrast>/")
+                        default="/vast/tibrahim/jil202/data",
+                        help="Root containing train/<anatomy>/ and test/<anatomy>/")
     parser.add_argument("--contrast", type=str, required=True, nargs="+",
-                        choices=["mprage", "tse", "mp2rage", "swi", "flair"],
-                        help="One or more contrasts to train on, e.g. "
-                             "`--contrast mprage` or `--contrast mprage tse`")
+                        choices=["brain", "knee", "prostate"],
+                        help="One or more anatomy groups to train on, e.g. "
+                             "`--contrast brain` or `--contrast brain knee prostate`. "
+                             "Each spans all of that anatomy's acquisitions and "
+                             "the artifact->raw / artifact->denoised / raw->denoised "
+                             "restoration tasks.")
 
     # Training
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -185,8 +242,8 @@ def parse_args():
 
     # Classifier-free guidance
     parser.add_argument("--cfg_dropout_prob", type=float, default=0.1,
-                        help="Probability of replacing the encoded context "
-                             "with the learnable null embedding during training.")
+                        help="Probability of replacing a sample's text prompt "
+                             "with the empty prompt during training (CFG).")
     parser.add_argument("--val_guidance_scales", type=float, nargs="+",
                         default=[0.0, 1.0, 1.5],
                         help="Guidance scales evaluated each validation. "
@@ -278,32 +335,6 @@ def visualize_flow_results(epoch, flow_matcher, device, condition, target, args,
     return metrics["SSIM"], metrics["PSNR"], metrics["LPIPS"]
 
 
-def validate_one_step(flow_matcher, device, condition, target, args, context=None,
-                      null_context=None, guidance_scale=1.0, noise=None):
-    """Sample once on a 3D patch, return SSIM/PSNR/LPIPS on central slice + the full generated patch.
-
-    `noise` (if given) is the shared initial state passed to `sample`, so
-    multiple guidance scales integrate from identical noise.
-    """
-    flow_matcher.eval()
-    with torch.no_grad():
-        generated = flow_matcher.sample(
-            condition=condition,
-            num_steps=args.num_sampling_steps,
-            device=device,
-            context=context,
-            null_context=null_context,
-            guidance_scale=guidance_scale,
-            noise=noise,
-        )
-
-    cz = condition.shape[-1] // 2
-    gen_np = generated[..., cz].cpu().numpy()
-    targ_np = target[..., cz].cpu().numpy()
-    metrics = evaluate_image_quality(gen_np, targ_np)
-    return metrics["SSIM"], metrics["PSNR"], metrics["LPIPS"], generated
-
-
 def train(local_rank, args):
     """Main training function."""
     torch.set_float32_matmul_precision("high")
@@ -361,18 +392,18 @@ def train(local_rank, args):
     if global_rank == 0:
         print(f"Data loaders created, train: {len(train_loader)}, val: {len(val_loader)}")
 
+    text_conditioner = TextConditioner()
     model = DiffusionModelUNet(
         spatial_dims=3,
         in_channels=2,
         out_channels=1,
-        channels=(64, 128, 256),
-        attention_levels=(False, False, False),
+        channels=(128, 128, 256),
+        attention_levels=(False, False, True),
         num_res_blocks=2,
         num_head_channels=256,
         with_conditioning=True,
-        cross_attention_dim=CONTEXT_OUTPUT_DIM,
+        cross_attention_dim=text_conditioner.hidden_size,
     )
-    context_encoder = ContextEncoder()
 
     if os.path.exists(args.checkpoint_path):
         if global_rank == 0:
@@ -421,18 +452,16 @@ def train(local_rank, args):
         if isinstance(ckpt, dict) and "model" in ckpt:
             model_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
             _load_relaxed(model, model_sd, "model")
-            if "context_encoder" in ckpt:
-                ctx_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["context_encoder"].items()}
-                _load_relaxed(context_encoder, ctx_sd, "context_encoder")
+            if "context_encoder" in ckpt and global_rank == 0:
+                print("Ignoring legacy context_encoder weights (scalar-context "
+                      "model); text conditioning uses frozen RadBERT.")
         else:
-            # Backward-compat: legacy checkpoint with bare model state dict (no context_encoder).
+            # Backward-compat: legacy checkpoint with bare model state dict.
             state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt.items()}
             _load_relaxed(model, state_dict, "model")
-            if global_rank == 0:
-                print("Legacy checkpoint loaded; context_encoder initialized from scratch.")
 
     model.to(device)
-    context_encoder.to(device)
+    text_conditioner.to(device)
 
     if args.compile:
         model = torch.compile(model)
@@ -443,12 +472,10 @@ def train(local_rank, args):
         if dist.is_initialized():
             dist.barrier()
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        context_encoder = DDP(context_encoder, device_ids=[local_rank],
-                              output_device=local_rank, find_unused_parameters=False)
         flow_matcher.model = model
 
     optimizer = torch.optim.AdamW(
-        params=list(model.parameters()) + list(context_encoder.parameters()),
+        params=model.parameters(),
         lr=args.lr, weight_decay=0.01,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -456,11 +483,9 @@ def train(local_rank, args):
     )
     scaler = GradScaler(enabled=False)
 
-    best_ssim_psnr = 0
+    best_score = 0.0
     ema = EMA(model, args.ema_decay)
     ema.register()
-    ema_ctx = EMA(context_encoder, args.ema_decay)
-    ema_ctx.register()
 
     if global_rank == 0:
         print(f"Starting 3D flow matching training (world_size={args.world_size})")
@@ -484,22 +509,18 @@ def train(local_rank, args):
         else:
             progress_bar = enumerate(train_loader)
 
-        for step, (condition, target, ctx_vec) in progress_bar:
+        for step, (condition, target, prompts, _target_types) in progress_bar:
             condition = condition.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            ctx_vec = ctx_vec.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             t = torch.rand(condition.shape[0], device=device)
 
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.fp16):
                 x0 = torch.randn_like(target)
-                ctx_emb = context_encoder(ctx_vec)
-                if args.cfg_dropout_prob > 0:
-                    bsz = ctx_emb.shape[0]
-                    ctx_module = context_encoder.module if args.distributed else context_encoder
-                    drop = (torch.rand(bsz, 1, 1, device=device) < args.cfg_dropout_prob)
-                    ctx_emb = torch.where(drop, ctx_module.null(bsz), ctx_emb)
+                ctx_emb = text_conditioner.encode(
+                    prompts, device, cfg_dropout_prob=args.cfg_dropout_prob,
+                )
                 loss = flow_matcher(
                     x0=x0, x1=target,
                     condition=condition, t=t,
@@ -527,7 +548,6 @@ def train(local_rank, args):
 
             if epoch >= args.ema_start_epoch:
                 ema.update()
-                ema_ctx.update()
 
             epoch_loss += loss.item()
 
@@ -553,63 +573,76 @@ def train(local_rank, args):
             use_ema = (epoch >= args.ema_start_epoch)
             if use_ema:
                 ema.apply_shadow()
-                ema_ctx.apply_shadow()
 
             model.eval()
-            context_encoder.eval()
-            ctx_module = context_encoder.module if args.distributed else context_encoder
 
             scales = args.val_guidance_scales
-            # Per-scale running sums of central-slice metrics.
-            sum_ssim = {s: 0.0 for s in scales}
-            sum_psnr = {s: 0.0 for s in scales}
-            sum_lpips = {s: 0.0 for s in scales}
-            val_batches = 0
+            # Per-(scale, target_type) sample-weighted sums of central-slice
+            # metrics. Splitting by target_type lets checkpoint selection weight
+            # the "Fully sampled" (raw) and "Denoised and biascorrected"
+            # (denoised) prompt capabilities equally, instead of letting the
+            # more numerous denoised pairs dominate a pooled average.
+            sum_ssim = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
+            sum_psnr = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
+            sum_lpips = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
+            sum_n = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
 
             # Cap validation at ~1000 images globally (split across ranks under DDP).
             max_val_images_per_rank = max(1, 1000 // max(1, world_size))
             val_images_seen = 0
 
-            for i, (condition, target, ctx_vec) in enumerate(val_loader):
+            for i, (condition, target, prompts, target_types) in enumerate(val_loader):
                 condition = condition.to(device)
                 target = target.to(device)
-                ctx_vec = ctx_vec.to(device)
-                ctx_emb = context_encoder(ctx_vec)
-                null_emb = ctx_module.null(ctx_emb.shape[0])
+                ctx_emb = text_conditioner.encode(prompts, device)
+                null_emb = text_conditioner.null(len(prompts))
+
+                # Indices in this batch belonging to each target type.
+                idx_by_tt = {
+                    tt: [j for j, t in enumerate(target_types) if t == tt]
+                    for tt in TARGET_TYPES
+                }
 
                 # Shared initial noise across guidance scales: any difference
                 # between cfg=0 (no context) and cfg>0 then reflects context,
                 # not the random draw.
                 shared_noise = torch.randn_like(condition)
 
+                cz = condition.shape[-1] // 2
                 gen_for_viz = {}
                 for s in scales:
-                    b_ssim, b_psnr, b_lpips, generated = validate_one_step(
-                        flow_matcher=flow_matcher,
-                        device=device,
-                        condition=condition,
-                        target=target,
-                        args=args,
-                        context=ctx_emb,
-                        null_context=null_emb,
-                        guidance_scale=s,
-                        noise=shared_noise,
-                    )
-                    sum_ssim[s] += b_ssim
-                    sum_psnr[s] += b_psnr
-                    sum_lpips[s] += b_lpips
+                    with torch.no_grad():
+                        generated = flow_matcher.sample(
+                            condition=condition,
+                            num_steps=args.num_sampling_steps,
+                            device=device,
+                            context=ctx_emb,
+                            null_context=null_emb,
+                            guidance_scale=s,
+                            noise=shared_noise,
+                        )
+                    for tt, idx in idx_by_tt.items():
+                        if not idx:
+                            continue
+                        gen_np = generated[idx][..., cz].cpu().numpy()
+                        targ_np = target[idx][..., cz].cpu().numpy()
+                        m = evaluate_image_quality(gen_np, targ_np)
+                        pv = m["PSNR"] if np.isfinite(m["PSNR"]) else 100.0
+                        n = len(idx)
+                        sum_ssim[s][tt] += m["SSIM"] * n
+                        sum_psnr[s][tt] += pv * n
+                        sum_lpips[s][tt] += m["LPIPS"] * n
+                        sum_n[s][tt] += n
                     if i == 0 and global_rank == 0:
                         gen_for_viz[s] = generated
 
-                val_batches += 1
                 val_images_seen += condition.shape[0]
 
                 if i == 0 and global_rank == 0:
-                    cz = condition.shape[-1] // 2
-                    panels = [("Undersampled (input)", condition[0, 0, :, :, cz])]
+                    panels = [("Input", condition[0, 0, :, :, cz])]
                     panels += [(f"cfg={s:g}", gen_for_viz[s][0, 0, :, :, cz])
                                for s in scales]
-                    panels += [("Ground truth", target[0, 0, :, :, cz])]
+                    panels += [(f"Target ({target_types[0]})", target[0, 0, :, :, cz])]
                     fig, axes = plt.subplots(1, len(panels),
                                              figsize=(5 * len(panels), 5))
                     for ax, (title, img) in zip(axes, panels):
@@ -626,37 +659,65 @@ def train(local_rank, args):
             if args.distributed:
                 flat = []
                 for s in scales:
-                    flat += [sum_ssim[s], sum_psnr[s], sum_lpips[s]]
-                flat.append(val_batches)
+                    for tt in TARGET_TYPES:
+                        flat += [sum_ssim[s][tt], sum_psnr[s][tt],
+                                 sum_lpips[s][tt], sum_n[s][tt]]
                 metrics_tensor = torch.tensor(flat, device=device)
                 dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-                for j, s in enumerate(scales):
-                    sum_ssim[s] = metrics_tensor[3 * j].item()
-                    sum_psnr[s] = metrics_tensor[3 * j + 1].item()
-                    sum_lpips[s] = metrics_tensor[3 * j + 2].item()
-                val_batches = metrics_tensor[-1].item()
+                k = 0
+                for s in scales:
+                    for tt in TARGET_TYPES:
+                        sum_ssim[s][tt] = metrics_tensor[k].item()
+                        sum_psnr[s][tt] = metrics_tensor[k + 1].item()
+                        sum_lpips[s][tt] = metrics_tensor[k + 2].item()
+                        sum_n[s][tt] = metrics_tensor[k + 3].item()
+                        k += 4
 
-            val_batches = max(val_batches, 1)
-            avg_ssim = {s: sum_ssim[s] / val_batches for s in scales}
-            avg_psnr = {s: sum_psnr[s] / val_batches for s in scales}
-            avg_lpips = {s: sum_lpips[s] / val_batches for s in scales}
+            # Sample-weighted averages + balanced score per (scale, target_type).
+            avg_ssim = {s: {} for s in scales}
+            avg_psnr = {s: {} for s in scales}
+            avg_lpips = {s: {} for s in scales}
+            score = {s: {} for s in scales}
+            for s in scales:
+                for tt in TARGET_TYPES:
+                    n = sum_n[s][tt]
+                    if n <= 0:
+                        continue
+                    avg_ssim[s][tt] = sum_ssim[s][tt] / n
+                    avg_psnr[s][tt] = sum_psnr[s][tt] / n
+                    avg_lpips[s][tt] = sum_lpips[s][tt] / n
+                    score[s][tt] = selection_score(
+                        avg_ssim[s][tt], avg_psnr[s][tt], avg_lpips[s][tt]
+                    )
 
             if global_rank == 0:
                 for s in scales:
-                    print(f"Validation [cfg={s:g}] - SSIM: {avg_ssim[s]:.4f}, "
-                          f"PSNR: {avg_psnr[s]:.4f}, LPIPS: {avg_lpips[s]:.4f}")
+                    for tt in TARGET_TYPES:
+                        if tt in score[s]:
+                            print(f"Validation [cfg={s:g}, {tt}] - "
+                                  f"SSIM: {avg_ssim[s][tt]:.4f}, "
+                                  f"PSNR: {avg_psnr[s][tt]:.4f}, "
+                                  f"LPIPS: {avg_lpips[s][tt]:.4f}, "
+                                  f"score: {score[s][tt]:.4f}")
 
             ckpt_s = args.ckpt_guidance_scale
             if global_rank == 0 and args.save_model:
-                ssim_psnr = 0.7 * avg_ssim[ckpt_s] + 0.3 * avg_psnr[ckpt_s]
-                if ssim_psnr > best_ssim_psnr:
-                    best_ssim_psnr = ssim_psnr
+                # Mean of the per-target-type balanced scores: the "Fully
+                # sampled" and "Denoised and biascorrected" capabilities count
+                # equally, so a checkpoint must be good at both to win.
+                per_tt = [score[ckpt_s][tt] for tt in TARGET_TYPES
+                          if tt in score[ckpt_s]]
+                combined = sum(per_tt) / len(per_tt) if per_tt else 0.0
+                if combined > best_score:
+                    best_score = combined
                     contrast_tag = "_".join(args.contrast)
-                    checkpoint_path = f"./checkpoints/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
+                    checkpoint_path = f"./checkpoints_s/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
-                    ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
-                    torch.save({"model": model_sd, "context_encoder": ctx_sd}, checkpoint_path)
-                    print(f"Saved best model (cfg={ckpt_s:g}) with Score: {ssim_psnr:.4f}")
+                    torch.save({"model": model_sd}, checkpoint_path)
+                    detail = ", ".join(f"{tt}={score[ckpt_s][tt]:.4f}"
+                                       for tt in TARGET_TYPES if tt in score[ckpt_s])
+                    print(f"Saved best model (cfg={ckpt_s:g}) combined "
+                          f"score: {combined:.4f} ({detail})")
 
             if args.log and global_rank == 0:
                 log_dict = {
@@ -665,22 +726,24 @@ def train(local_rank, args):
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 for s in scales:
-                    tag = f"cfg{s:g}"
-                    log_dict[f"val_ssim_{tag}"] = avg_ssim[s]
-                    log_dict[f"val_psnr_{tag}"] = avg_psnr[s]
-                    log_dict[f"val_lpips_{tag}"] = avg_lpips[s]
+                    for tt in TARGET_TYPES:
+                        if tt not in score[s]:
+                            continue
+                        tag = f"cfg{s:g}_{tt}"
+                        log_dict[f"val_ssim_{tag}"] = avg_ssim[s][tt]
+                        log_dict[f"val_psnr_{tag}"] = avg_psnr[s][tt]
+                        log_dict[f"val_lpips_{tag}"] = avg_lpips[s][tt]
+                        log_dict[f"val_score_{tag}"] = score[s][tt]
                 wandb.log(log_dict)
 
             if use_ema:
                 ema.restore()
-                ema_ctx.restore()
 
     if global_rank == 0 and args.save_model:
         contrast_tag = "_".join(args.contrast)
-        final_path = f"./checkpoints/flow_matching_3d_{contrast_tag}_final.pt"
+        final_path = f"./checkpoints_s/flow_matching_3d_{contrast_tag}_final.pt"
         model_sd = model.module.state_dict() if args.distributed else model.state_dict()
-        ctx_sd = context_encoder.module.state_dict() if args.distributed else context_encoder.state_dict()
-        torch.save({"model": model_sd, "context_encoder": ctx_sd}, final_path)
+        torch.save({"model": model_sd}, final_path)
 
     if args.distributed:
         dist.barrier()
