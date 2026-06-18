@@ -3,11 +3,12 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cluster=gpu
-#SBATCH --partition=rtx6k
+#SBATCH --partition=a100_nvlink
 #SBATCH --mail-user=jil202@pitt.edu
 #SBATCH --mail-type=END,FAIL
-#SBATCH --time=0-99:00:00
+#SBATCH --time=0-24:00:00
 #SBATCH --gres=gpu:8
+#SBATCH --constraint=80g
 
 # Usage:
 #   sbatch train_flow.sh           (default: all anatomies)
@@ -36,8 +37,8 @@ python -m torch.distributed.run --nproc_per_node=$NGPU train_flow.py \
         --contrast $CONTRASTS \
         --data_root $DATA_ROOT \
         --distributed --fp16 --save_model --compile \
-        --batch_size 8 --max_epochs 100 --sample 100 \
+        --batch_size 4 --max_epochs 100 --sample 100 \
         --num_sampling_steps 2 --samples_per_contrast 0 \
-        --cfg_dropout_prob 0.1 --size 192 
+        --cfg_dropout_prob 0.1 --size 192 --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints_s/flow_matching_3d_brain_knee_prostate_best_epoch_57.pt
 # To warm-start from a prior model instead, point --checkpoint_path at an
 # existing .pt (architecture is unchanged); the relaxed loader handles mismatches.

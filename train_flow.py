@@ -68,6 +68,18 @@ def selection_score(ssim, psnr, lpips):
     return (ssim + psnr_term + (1.0 - lpips)) / 3.0
 
 
+def uncertainty_error_corr(unc, err):
+    """Pearson correlation between a predicted-uncertainty map and the abs-error
+    map (both flattened). A well-calibrated variance head makes this positive:
+    voxels the model flags as uncertain are the ones it actually gets wrong.
+    Returns 0.0 when either map is (near-)constant."""
+    u = np.asarray(unc, dtype=np.float64).ravel()
+    e = np.asarray(err, dtype=np.float64).ravel()
+    if u.std() < 1e-8 or e.std() < 1e-8:
+        return 0.0
+    return float(np.corrcoef(u, e)[0, 1])
+
+
 class TextConditioner(nn.Module):
     """Frozen RadBERT text encoder -> (B, seq_len, hidden) cross-attention context.
 
@@ -122,13 +134,24 @@ class TextConditioner(nn.Module):
 class FlowMatcher(nn.Module):
     """Flow Matching for 3D patch translation, with context conditioning."""
 
-    def __init__(self, model, sigma_min=0.001):
+    def __init__(self, model, sigma_min=0.001, logvar_clamp=7.0):
         super().__init__()
         self.model = model
         self.sigma_min = sigma_min
+        # The model now outputs 2 channels: [0] = velocity mean, [1] = the
+        # per-voxel log-variance of the velocity (heteroscedastic uncertainty,
+        # UA-Flow style). logvar is clamped for numerical stability.
+        self.logvar_clamp = logvar_clamp
 
-    def forward(self, x0, x1, condition, t, context=None):
-        """Compute the flow matching loss on a 3D patch.
+    def forward(self, x0, x1, condition, t, context=None, use_nll=True):
+        """Flow matching loss on a 3D patch with a heteroscedastic variance head.
+
+        The model predicts a velocity mean and a per-voxel log-variance. The
+        loss is the Gaussian negative log-likelihood
+            0.5 * [ exp(-s) * (v_pred - v_t)^2 + s ],   s = log sigma^2,
+        which reduces to MSE when the variance is held constant. `use_nll=False`
+        falls back to plain MSE on the mean channel (warm-up before the variance
+        head is trusted).
 
         Shapes:
             x0, x1, condition : (B, 1, X, Y, Z)
@@ -150,30 +173,46 @@ class FlowMatcher(nn.Module):
         timesteps = (t * 999).long()
         model_input = torch.cat([x_t, condition], dim=1)
 
-        v_pred = self.model(model_input, timesteps, context=context)
-        return F.mse_loss(v_pred, v_t)
+        out = self.model(model_input, timesteps, context=context)
+        v_pred = out[:, 0:1]
+        logvar = out[:, 1:2].clamp(-self.logvar_clamp, self.logvar_clamp)
+        se = (v_pred - v_t) ** 2
+        if use_nll:
+            loss = 0.5 * (torch.exp(-logvar) * se + logvar)
+        else:
+            loss = se
+        return loss.mean()
 
     @torch.no_grad()
     def _guided_velocity(self, model_input, timesteps, context, null_context,
                          guidance_scale):
-        """Velocity with optional classifier-free guidance.
+        """(velocity, logvar) with optional classifier-free guidance.
 
         guidance_scale == 1.0 (or no null_context) -> single conditional eval.
         guidance_scale == 0.0 -> single unconditional eval (pure null context).
         otherwise -> two evals mixed as v_uncond + scale * (v_cond - v_uncond).
+        The returned logvar is the conditional branch's (or the unconditional
+        branch's when guidance_scale == 0.0).
         """
+        out_c = self.model(model_input, timesteps, context=context)
+        v_cond, logvar = out_c[:, 0:1], out_c[:, 1:2]
         if guidance_scale == 1.0 or null_context is None:
-            return self.model(model_input, timesteps, context=context)
+            return v_cond, logvar
+        out_u = self.model(model_input, timesteps, context=null_context)
+        v_uncond = out_u[:, 0:1]
         if guidance_scale == 0.0:
-            return self.model(model_input, timesteps, context=null_context)
-        v_cond = self.model(model_input, timesteps, context=context)
-        v_uncond = self.model(model_input, timesteps, context=null_context)
-        return v_uncond + guidance_scale * (v_cond - v_uncond)
+            return v_uncond, out_u[:, 1:2]
+        return v_uncond + guidance_scale * (v_cond - v_uncond), logvar
 
     @torch.no_grad()
     def sample(self, condition, num_steps=50, device="cuda", context=None,
                null_context=None, guidance_scale=1.0, noise=None):
         """Euler ODE integration in 3D, with optional classifier-free guidance.
+
+        Returns `(x, uncertainty)`. `x` is the generated patch; `uncertainty` is
+        the per-voxel predictive std obtained by propagating the velocity
+        variance through the Euler steps: Var = sum_i (dt^2 * sigma_v(t_i)^2),
+        uncertainty = sqrt(Var).
 
         `noise` is the initial state x(t=0). Pass a fixed tensor to compare
         guidance scales under identical noise (so the difference reflects
@@ -182,17 +221,21 @@ class FlowMatcher(nn.Module):
         batch_size = condition.shape[0]
         x = torch.randn_like(condition).to(device) if noise is None else noise.to(device)
         dt = 1.0 / num_steps
+        var_accum = torch.zeros_like(x)
 
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=device)
             timesteps = (t * 999).long()
             model_input = torch.cat([x, condition], dim=1)
-            v = self._guided_velocity(
+            v, logvar = self._guided_velocity(
                 model_input, timesteps, context, null_context, guidance_scale,
+            )
+            var_accum = var_accum + (dt ** 2) * torch.exp(
+                logvar.clamp(-self.logvar_clamp, self.logvar_clamp)
             )
             x = x + v * dt
 
-        return x
+        return x, var_accum.sqrt()
 
 
 def parse_args():
@@ -211,7 +254,7 @@ def parse_args():
                              "restoration tasks.")
 
     # Training
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_epochs", type=int, default=100)
@@ -239,6 +282,17 @@ def parse_args():
     # Flow matching
     parser.add_argument("--sigma_min", type=float, default=0.001)
     parser.add_argument("--num_sampling_steps", type=int, default=2)
+
+    # Heteroscedastic uncertainty (UA-Flow) variance head
+    parser.add_argument("--nll_warmup_epochs", type=int, default=0,
+                        help="Epochs of plain MSE on the velocity mean before "
+                             "switching to the heteroscedastic NLL that also "
+                             "trains the variance head. 0 = NLL from the start "
+                             "(fine; the mean head warm-starts from the "
+                             "checkpoint).")
+    parser.add_argument("--logvar_clamp", type=float, default=7.0,
+                        help="Clamp on the predicted velocity log-variance for "
+                             "numerical stability (|log sigma^2| <= this).")
 
     # Classifier-free guidance
     parser.add_argument("--cfg_dropout_prob", type=float, default=0.1,
@@ -302,7 +356,7 @@ def visualize_flow_results(epoch, flow_matcher, device, condition, target, args,
     flow_matcher.eval()
 
     with torch.no_grad():
-        generated = flow_matcher.sample(
+        generated, _unc = flow_matcher.sample(
             condition=condition,
             num_steps=args.num_sampling_steps,
             device=device,
@@ -396,7 +450,7 @@ def train(local_rank, args):
     model = DiffusionModelUNet(
         spatial_dims=3,
         in_channels=2,
-        out_channels=1,
+        out_channels=2,  # [0] velocity mean, [1] velocity log-variance
         channels=(128, 128, 256),
         attention_levels=(False, False, True),
         num_res_blocks=2,
@@ -423,24 +477,29 @@ def train(local_rank, args):
                 if v.shape == tv.shape:
                     filtered[k] = v
                     continue
-                if v.dim() == tv.dim() and all(
-                    (sd == td) or (i == 1)
-                    for i, (sd, td) in enumerate(zip(v.shape, tv.shape))
-                ):
+                diff_dims = [i for i, (sd, td) in enumerate(zip(v.shape, tv.shape))
+                             if sd != td]
+                if v.dim() == tv.dim() and len(diff_dims) == 1:
+                    # Partial copy along the single differing dim. Handles both
+                    # the input-conv channel growth (dim 1, e.g. 2->N) and the
+                    # output-conv channel growth (dim 0, 1->2) introduced by the
+                    # variance head: the existing velocity weights land in
+                    # channel 0, the new variance channel stays freshly init'd.
+                    d = diff_dims[0]
                     new_v = tv.clone()
-                    c = min(v.shape[1], tv.shape[1])
-                    slicer_src = (slice(None), slice(0, c)) + (slice(None),) * (v.dim() - 2)
-                    slicer_tgt = (slice(None), slice(0, c)) + (slice(None),) * (tv.dim() - 2)
-                    new_v[slicer_tgt] = v[slicer_src]
+                    c = min(v.shape[d], tv.shape[d])
+                    slicer = tuple(slice(0, c) if i == d else slice(None)
+                                   for i in range(v.dim()))
+                    new_v[slicer] = v[slicer]
                     filtered[k] = new_v
-                    partial.append((k, tuple(v.shape), tuple(tv.shape), c))
+                    partial.append((k, tuple(v.shape), tuple(tv.shape), c, d))
                 else:
                     skipped.append((k, tuple(v.shape), tuple(tv.shape)))
             missing, unexpected = target_module.load_state_dict(filtered, strict=False)
             if global_rank == 0:
                 if partial:
-                    for k, sshape, tshape, c in partial:
-                        print(f"  [{label}] partial copy {k}: ckpt {sshape} -> model {tshape}, copied {c} channels along dim 1")
+                    for k, sshape, tshape, c, d in partial:
+                        print(f"  [{label}] partial copy {k}: ckpt {sshape} -> model {tshape}, copied {c} channels along dim {d}")
                 if skipped:
                     for k, sshape, tshape in skipped:
                         print(f"  [{label}] skipped {k}: ckpt {sshape} vs model {tshape}")
@@ -466,7 +525,8 @@ def train(local_rank, args):
     if args.compile:
         model = torch.compile(model)
 
-    flow_matcher = FlowMatcher(model, sigma_min=args.sigma_min)
+    flow_matcher = FlowMatcher(model, sigma_min=args.sigma_min,
+                               logvar_clamp=args.logvar_clamp)
 
     if args.distributed:
         if dist.is_initialized():
@@ -525,6 +585,7 @@ def train(local_rank, args):
                     x0=x0, x1=target,
                     condition=condition, t=t,
                     context=ctx_emb,
+                    use_nll=(epoch >= args.nll_warmup_epochs),
                 )
 
             nan_flag = torch.tensor(
@@ -585,6 +646,11 @@ def train(local_rank, args):
             sum_ssim = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
             sum_psnr = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
             sum_lpips = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
+            # Variance-head diagnostics: mean predicted uncertainty and its
+            # correlation with the actual abs error (higher corr = better
+            # calibrated). These track but don't drive checkpoint selection.
+            sum_ucorr = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
+            sum_umean = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
             sum_n = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
 
             # Cap validation at ~1000 images globally (split across ranks under DDP).
@@ -612,7 +678,7 @@ def train(local_rank, args):
                 gen_for_viz = {}
                 for s in scales:
                     with torch.no_grad():
-                        generated = flow_matcher.sample(
+                        generated, uncertainty = flow_matcher.sample(
                             condition=condition,
                             num_steps=args.num_sampling_steps,
                             device=device,
@@ -626,12 +692,16 @@ def train(local_rank, args):
                             continue
                         gen_np = generated[idx][..., cz].cpu().numpy()
                         targ_np = target[idx][..., cz].cpu().numpy()
+                        unc_np = uncertainty[idx][..., cz].cpu().numpy()
                         m = evaluate_image_quality(gen_np, targ_np)
                         pv = m["PSNR"] if np.isfinite(m["PSNR"]) else 100.0
                         n = len(idx)
                         sum_ssim[s][tt] += m["SSIM"] * n
                         sum_psnr[s][tt] += pv * n
                         sum_lpips[s][tt] += m["LPIPS"] * n
+                        sum_ucorr[s][tt] += uncertainty_error_corr(
+                            unc_np, np.abs(gen_np - targ_np)) * n
+                        sum_umean[s][tt] += float(unc_np.mean()) * n
                         sum_n[s][tt] += n
                     if i == 0 and global_rank == 0:
                         gen_for_viz[s] = generated
@@ -661,7 +731,8 @@ def train(local_rank, args):
                 for s in scales:
                     for tt in TARGET_TYPES:
                         flat += [sum_ssim[s][tt], sum_psnr[s][tt],
-                                 sum_lpips[s][tt], sum_n[s][tt]]
+                                 sum_lpips[s][tt], sum_ucorr[s][tt],
+                                 sum_umean[s][tt], sum_n[s][tt]]
                 metrics_tensor = torch.tensor(flat, device=device)
                 dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
                 k = 0
@@ -670,13 +741,17 @@ def train(local_rank, args):
                         sum_ssim[s][tt] = metrics_tensor[k].item()
                         sum_psnr[s][tt] = metrics_tensor[k + 1].item()
                         sum_lpips[s][tt] = metrics_tensor[k + 2].item()
-                        sum_n[s][tt] = metrics_tensor[k + 3].item()
-                        k += 4
+                        sum_ucorr[s][tt] = metrics_tensor[k + 3].item()
+                        sum_umean[s][tt] = metrics_tensor[k + 4].item()
+                        sum_n[s][tt] = metrics_tensor[k + 5].item()
+                        k += 6
 
             # Sample-weighted averages + balanced score per (scale, target_type).
             avg_ssim = {s: {} for s in scales}
             avg_psnr = {s: {} for s in scales}
             avg_lpips = {s: {} for s in scales}
+            avg_ucorr = {s: {} for s in scales}
+            avg_umean = {s: {} for s in scales}
             score = {s: {} for s in scales}
             for s in scales:
                 for tt in TARGET_TYPES:
@@ -686,6 +761,8 @@ def train(local_rank, args):
                     avg_ssim[s][tt] = sum_ssim[s][tt] / n
                     avg_psnr[s][tt] = sum_psnr[s][tt] / n
                     avg_lpips[s][tt] = sum_lpips[s][tt] / n
+                    avg_ucorr[s][tt] = sum_ucorr[s][tt] / n
+                    avg_umean[s][tt] = sum_umean[s][tt] / n
                     score[s][tt] = selection_score(
                         avg_ssim[s][tt], avg_psnr[s][tt], avg_lpips[s][tt]
                     )
@@ -698,6 +775,8 @@ def train(local_rank, args):
                                   f"SSIM: {avg_ssim[s][tt]:.4f}, "
                                   f"PSNR: {avg_psnr[s][tt]:.4f}, "
                                   f"LPIPS: {avg_lpips[s][tt]:.4f}, "
+                                  f"unc_mean: {avg_umean[s][tt]:.4f}, "
+                                  f"unc_corr: {avg_ucorr[s][tt]:.4f}, "
                                   f"score: {score[s][tt]:.4f}")
 
             ckpt_s = args.ckpt_guidance_scale
@@ -711,7 +790,8 @@ def train(local_rank, args):
                 if combined > best_score:
                     best_score = combined
                     contrast_tag = "_".join(args.contrast)
-                    checkpoint_path = f"./checkpoints_s/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
+                    checkpoint_path = f"./checkpoints_s_uncertainty/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
+                    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
                     torch.save({"model": model_sd}, checkpoint_path)
                     detail = ", ".join(f"{tt}={score[ckpt_s][tt]:.4f}"
@@ -733,6 +813,8 @@ def train(local_rank, args):
                         log_dict[f"val_ssim_{tag}"] = avg_ssim[s][tt]
                         log_dict[f"val_psnr_{tag}"] = avg_psnr[s][tt]
                         log_dict[f"val_lpips_{tag}"] = avg_lpips[s][tt]
+                        log_dict[f"val_unc_mean_{tag}"] = avg_umean[s][tt]
+                        log_dict[f"val_unc_corr_{tag}"] = avg_ucorr[s][tt]
                         log_dict[f"val_score_{tag}"] = score[s][tt]
                 wandb.log(log_dict)
 
@@ -741,7 +823,8 @@ def train(local_rank, args):
 
     if global_rank == 0 and args.save_model:
         contrast_tag = "_".join(args.contrast)
-        final_path = f"./checkpoints_s/flow_matching_3d_{contrast_tag}_final.pt"
+        final_path = f"./checkpoints_s_uncertainty/flow_matching_3d_{contrast_tag}_final.pt"
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
         model_sd = model.module.state_dict() if args.distributed else model.state_dict()
         torch.save({"model": model_sd}, final_path)
 
