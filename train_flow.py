@@ -220,12 +220,42 @@ def parse_args():
     parser.add_argument("--size", type=int, default=196,
                         help="Patch size (in voxels). Actual patch shape is (size, size, 16) to ")
 
-    parser.add_argument("--samples_per_contrast", type=int, default=None,
-                        help="If set, each contrast contributes this many "
-                             "training samples per epoch (0 = auto-balance to "
-                             "the smallest contrast). The larger contrast "
-                             "cycles through a fresh random subset each epoch.")
+    parser.add_argument("--samples_per_contrast", type=int, default=None, nargs="+",
+                        help="Per-epoch training samples per contrast. Pass one "
+                             "value to apply it to every contrast (0 = auto-balance "
+                             "to the smallest contrast), or N values matching the N "
+                             "--contrast entries (same order) for per-anatomy "
+                             "quotas, e.g. `--contrast brain knee prostate "
+                             "--samples_per_contrast 20000 50000 50000`. The larger "
+                             "contrast cycles through a fresh random subset each "
+                             "epoch; an over-quota contrast is oversampled. Ignored "
+                             "for the artifact buckets when --cell_samples is set.")
+    parser.add_argument("--cell_samples", type=str, default=None, nargs="+",
+                        help="Per-epoch training samples per (anatomy x artifact) "
+                             "cell, as `anatomy:group=count` entries, e.g. "
+                             "`--cell_samples brain:undersample=4000 brain:spike=6000 "
+                             "brain:aniso=10000 knee:...`. group is one of "
+                             "{undersample (R*/GRAPPA), spike, aniso}. Every "
+                             "(contrast x {undersample,spike,aniso}) cell must be "
+                             "listed (missing cell = error). When set, the sampler "
+                             "buckets by cell and --samples_per_contrast is ignored "
+                             "for these artifact buckets. raw->denoised pairs are "
+                             "controlled separately by --denoise_samples_per_contrast.")
+    parser.add_argument("--denoise_samples_per_contrast", type=int, default=0,
+                        help="Per-epoch training samples for each anatomy's "
+                             "raw->denoised ('none' artifact) bucket when "
+                             "--cell_samples is set. Applied uniformly to every "
+                             "--contrast (0 = drop raw->denoised this run). Kept "
+                             "outside the --cell_samples artifact weighting.")
     parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_balanced_per_cell", type=int, default=100,
+                        help="Per-epoch validation is balanced across "
+                             "(anatomy x artifact-group) cells: this many pairs "
+                             "per (anatomy, {undersample,spike,aniso}) cell "
+                             "(0 = balance to the smallest cell). Checkpoint "
+                             "selection averages the per-cell scores, so every "
+                             "anatomy and artifact counts equally. Set <0 to "
+                             "disable (revert to the legacy 5% pooled val set).")
     parser.add_argument("--save_model", action="store_true")
     parser.add_argument("--fp16", action="store_true",
                         help="Enable bf16 mixed precision")
@@ -367,7 +397,72 @@ def train(local_rank, args):
         os.makedirs("visualization_results", exist_ok=True)
         os.makedirs("checkpoints", exist_ok=True)
 
-    from dataset import getloader_3d_patches
+    from dataset import getloader_3d_patches, ARTIFACT_GROUPS
+
+    # Build the sampler quota. With --cell_samples, buckets are keyed by
+    # (anatomy, artifact-group) cells; otherwise by anatomy (legacy).
+    cell_buckets = args.cell_samples is not None
+    if cell_buckets:
+        # Parse `anatomy:group=count` entries into {(anatomy, group): count}.
+        cell_quota = {}
+        for entry in args.cell_samples:
+            try:
+                cell, count = entry.split("=")
+                anat, group = cell.split(":")
+            except ValueError:
+                raise ValueError(
+                    f"--cell_samples entry {entry!r} is malformed; expected "
+                    f"`anatomy:group=count` (e.g. brain:aniso=10000)."
+                )
+            if anat not in args.contrast:
+                raise ValueError(
+                    f"--cell_samples names anatomy {anat!r} which is not in "
+                    f"--contrast {args.contrast}."
+                )
+            if group not in ARTIFACT_GROUPS:
+                raise ValueError(
+                    f"--cell_samples group {group!r} must be one of {ARTIFACT_GROUPS}."
+                )
+            cell_quota[(anat, group)] = int(count)
+        # Require every (contrast x artifact-group) cell to be specified.
+        required = {(a, g) for a in args.contrast for g in ARTIFACT_GROUPS}
+        missing = required - set(cell_quota)
+        if missing:
+            raise ValueError(
+                f"--cell_samples is missing cells {sorted(missing)}; every "
+                f"(contrast x {{{', '.join(ARTIFACT_GROUPS)}}}) cell must be listed."
+            )
+        # raw->denoised ('none') buckets: a fixed per-anatomy count.
+        if args.denoise_samples_per_contrast > 0:
+            for a in args.contrast:
+                cell_quota[(a, "none")] = args.denoise_samples_per_contrast
+        samples_per_contrast = cell_quota
+    else:
+        # --samples_per_contrast arrives as a list (nargs). One value -> scalar
+        # (applied to every contrast); N values matching --contrast -> per-anatomy
+        # {contrast: count} quota dict; None -> standard sampling.
+        samples_per_contrast = args.samples_per_contrast
+        if isinstance(samples_per_contrast, list):
+            if len(samples_per_contrast) == 1:
+                samples_per_contrast = samples_per_contrast[0]
+            elif len(samples_per_contrast) == len(args.contrast):
+                samples_per_contrast = dict(zip(args.contrast, samples_per_contrast))
+            else:
+                raise ValueError(
+                    f"--samples_per_contrast got {len(samples_per_contrast)} values but "
+                    f"there are {len(args.contrast)} --contrast entries; pass either one "
+                    f"value or one per contrast (same order)."
+                )
+    if global_rank == 0:
+        print(f"cell_buckets = {cell_buckets}")
+        print(f"samples_per_contrast = {samples_per_contrast}")
+
+    # <0 disables balanced validation (legacy 5% pooled val set); else balance
+    # the val set across (anatomy x artifact-group) cells, this many per cell.
+    val_balanced_per_cell = (None if args.val_balanced_per_cell < 0
+                             else args.val_balanced_per_cell)
+    if global_rank == 0:
+        print(f"val_balanced_per_cell = {val_balanced_per_cell}")
 
     if args.distributed:
         train_loader, val_loader = getloader_3d_patches(
@@ -377,7 +472,9 @@ def train(local_rank, args):
             sample=args.sample,
             distributed=True, rank=global_rank, world_size=world_size,
             num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
-            samples_per_contrast=args.samples_per_contrast,
+            samples_per_contrast=samples_per_contrast,
+            val_balanced_per_cell=val_balanced_per_cell,
+            cell_buckets=cell_buckets,
         )
     else:
         train_loader, val_loader = getloader_3d_patches(
@@ -386,7 +483,9 @@ def train(local_rank, args):
             contrast=args.contrast,
             sample=args.sample,
             num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
-            samples_per_contrast=args.samples_per_contrast,
+            samples_per_contrast=samples_per_contrast,
+            val_balanced_per_cell=val_balanced_per_cell,
+            cell_buckets=cell_buckets,
         )
 
     if global_rank == 0:
@@ -397,10 +496,10 @@ def train(local_rank, args):
         spatial_dims=3,
         in_channels=2,
         out_channels=1,
-        channels=(128, 128, 256),
+        channels=(128, 256, 512),
         attention_levels=(False, False, True),
         num_res_blocks=2,
-        num_head_channels=256,
+        num_head_channels=512,
         with_conditioning=True,
         cross_attention_dim=text_conditioner.hidden_size,
     )
@@ -509,7 +608,7 @@ def train(local_rank, args):
         else:
             progress_bar = enumerate(train_loader)
 
-        for step, (condition, target, prompts, _target_types) in progress_bar:
+        for step, (condition, target, prompts, _target_types, _anat, _art) in progress_bar:
             condition = condition.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
@@ -577,31 +676,31 @@ def train(local_rank, args):
             model.eval()
 
             scales = args.val_guidance_scales
-            # Per-(scale, target_type) sample-weighted sums of central-slice
-            # metrics. Splitting by target_type lets checkpoint selection weight
-            # the "Fully sampled" (raw) and "Denoised and biascorrected"
-            # (denoised) prompt capabilities equally, instead of letting the
-            # more numerous denoised pairs dominate a pooled average.
-            sum_ssim = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
-            sum_psnr = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
-            sum_lpips = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
-            sum_n = {s: {tt: 0.0 for tt in TARGET_TYPES} for s in scales}
+            # Per-(scale, cell) sample-weighted sums of central-slice metrics,
+            # where a cell is an (anatomy, artifact-group) pair. The val set is
+            # balanced across cells and checkpoint selection averages over them,
+            # so every anatomy AND artifact (undersampling / spike / anisotropic)
+            # counts equally instead of letting the numerous/easy cases dominate.
+            # The two target types live inside each cell and are pooled.
+            cells = [(a, g) for a in sorted(set(args.contrast))
+                     for g in ARTIFACT_GROUPS]
+            sum_ssim = {s: {c: 0.0 for c in cells} for s in scales}
+            sum_psnr = {s: {c: 0.0 for c in cells} for s in scales}
+            sum_lpips = {s: {c: 0.0 for c in cells} for s in scales}
+            sum_n = {s: {c: 0.0 for c in cells} for s in scales}
 
-            # Cap validation at ~1000 images globally (split across ranks under DDP).
-            max_val_images_per_rank = max(1, 1000 // max(1, world_size))
-            val_images_seen = 0
-
-            for i, (condition, target, prompts, target_types) in enumerate(val_loader):
+            for i, (condition, target, prompts, target_types,
+                    anatomies_b, artifacts_b) in enumerate(val_loader):
                 condition = condition.to(device)
                 target = target.to(device)
                 ctx_emb = text_conditioner.encode(prompts, device)
                 null_emb = text_conditioner.null(len(prompts))
 
-                # Indices in this batch belonging to each target type.
-                idx_by_tt = {
-                    tt: [j for j, t in enumerate(target_types) if t == tt]
-                    for tt in TARGET_TYPES
-                }
+                # Batch indices belonging to each (anatomy, artifact-group) cell.
+                idx_by_cell = {}
+                for j, key in enumerate(zip(anatomies_b, artifacts_b)):
+                    if key in sum_n[scales[0]]:
+                        idx_by_cell.setdefault(key, []).append(j)
 
                 # Shared initial noise across guidance scales: any difference
                 # between cfg=0 (no context) and cfg>0 then reflects context,
@@ -621,22 +720,18 @@ def train(local_rank, args):
                             guidance_scale=s,
                             noise=shared_noise,
                         )
-                    for tt, idx in idx_by_tt.items():
-                        if not idx:
-                            continue
+                    for c, idx in idx_by_cell.items():
                         gen_np = generated[idx][..., cz].cpu().numpy()
                         targ_np = target[idx][..., cz].cpu().numpy()
                         m = evaluate_image_quality(gen_np, targ_np)
                         pv = m["PSNR"] if np.isfinite(m["PSNR"]) else 100.0
                         n = len(idx)
-                        sum_ssim[s][tt] += m["SSIM"] * n
-                        sum_psnr[s][tt] += pv * n
-                        sum_lpips[s][tt] += m["LPIPS"] * n
-                        sum_n[s][tt] += n
+                        sum_ssim[s][c] += m["SSIM"] * n
+                        sum_psnr[s][c] += pv * n
+                        sum_lpips[s][c] += m["LPIPS"] * n
+                        sum_n[s][c] += n
                     if i == 0 and global_rank == 0:
                         gen_for_viz[s] = generated
-
-                val_images_seen += condition.shape[0]
 
                 if i == 0 and global_rank == 0:
                     panels = [("Input", condition[0, 0, :, :, cz])]
@@ -653,71 +748,68 @@ def train(local_rank, args):
                     plt.savefig(f"visualization_results/flow3d_epoch_{epoch}.png")
                     plt.close()
 
-                if val_images_seen >= max_val_images_per_rank:
-                    break
-
             if args.distributed:
                 flat = []
                 for s in scales:
-                    for tt in TARGET_TYPES:
-                        flat += [sum_ssim[s][tt], sum_psnr[s][tt],
-                                 sum_lpips[s][tt], sum_n[s][tt]]
+                    for c in cells:
+                        flat += [sum_ssim[s][c], sum_psnr[s][c],
+                                 sum_lpips[s][c], sum_n[s][c]]
                 metrics_tensor = torch.tensor(flat, device=device)
                 dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
                 k = 0
                 for s in scales:
-                    for tt in TARGET_TYPES:
-                        sum_ssim[s][tt] = metrics_tensor[k].item()
-                        sum_psnr[s][tt] = metrics_tensor[k + 1].item()
-                        sum_lpips[s][tt] = metrics_tensor[k + 2].item()
-                        sum_n[s][tt] = metrics_tensor[k + 3].item()
+                    for c in cells:
+                        sum_ssim[s][c] = metrics_tensor[k].item()
+                        sum_psnr[s][c] = metrics_tensor[k + 1].item()
+                        sum_lpips[s][c] = metrics_tensor[k + 2].item()
+                        sum_n[s][c] = metrics_tensor[k + 3].item()
                         k += 4
 
-            # Sample-weighted averages + balanced score per (scale, target_type).
+            # Sample-weighted averages + balanced score per (scale, cell).
             avg_ssim = {s: {} for s in scales}
             avg_psnr = {s: {} for s in scales}
             avg_lpips = {s: {} for s in scales}
             score = {s: {} for s in scales}
             for s in scales:
-                for tt in TARGET_TYPES:
-                    n = sum_n[s][tt]
+                for c in cells:
+                    n = sum_n[s][c]
                     if n <= 0:
                         continue
-                    avg_ssim[s][tt] = sum_ssim[s][tt] / n
-                    avg_psnr[s][tt] = sum_psnr[s][tt] / n
-                    avg_lpips[s][tt] = sum_lpips[s][tt] / n
-                    score[s][tt] = selection_score(
-                        avg_ssim[s][tt], avg_psnr[s][tt], avg_lpips[s][tt]
+                    avg_ssim[s][c] = sum_ssim[s][c] / n
+                    avg_psnr[s][c] = sum_psnr[s][c] / n
+                    avg_lpips[s][c] = sum_lpips[s][c] / n
+                    score[s][c] = selection_score(
+                        avg_ssim[s][c], avg_psnr[s][c], avg_lpips[s][c]
                     )
 
             if global_rank == 0:
                 for s in scales:
-                    for tt in TARGET_TYPES:
-                        if tt in score[s]:
-                            print(f"Validation [cfg={s:g}, {tt}] - "
-                                  f"SSIM: {avg_ssim[s][tt]:.4f}, "
-                                  f"PSNR: {avg_psnr[s][tt]:.4f}, "
-                                  f"LPIPS: {avg_lpips[s][tt]:.4f}, "
-                                  f"score: {score[s][tt]:.4f}")
+                    for c in cells:
+                        if c in score[s]:
+                            a, g = c
+                            print(f"Validation [cfg={s:g}, {a}/{g}] - "
+                                  f"SSIM: {avg_ssim[s][c]:.4f}, "
+                                  f"PSNR: {avg_psnr[s][c]:.4f}, "
+                                  f"LPIPS: {avg_lpips[s][c]:.4f}, "
+                                  f"score: {score[s][c]:.4f} "
+                                  f"(n={int(sum_n[s][c])})")
 
             ckpt_s = args.ckpt_guidance_scale
             if global_rank == 0 and args.save_model:
-                # Mean of the per-target-type balanced scores: the "Fully
-                # sampled" and "Denoised and biascorrected" capabilities count
-                # equally, so a checkpoint must be good at both to win.
-                per_tt = [score[ckpt_s][tt] for tt in TARGET_TYPES
-                          if tt in score[ckpt_s]]
-                combined = sum(per_tt) / len(per_tt) if per_tt else 0.0
+                # Mean of the per-(anatomy, artifact) balanced scores: every
+                # anatomy and artifact group counts equally, so a checkpoint must
+                # be good across all of them (not just the easy cells) to win.
+                cell_scores = [score[ckpt_s][c] for c in cells
+                               if c in score[ckpt_s]]
+                combined = sum(cell_scores) / len(cell_scores) if cell_scores else 0.0
                 if combined > best_score:
                     best_score = combined
                     contrast_tag = "_".join(args.contrast)
-                    checkpoint_path = f"./checkpoints_s/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
+                    checkpoint_path = f"./checkpoints_l/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
                     torch.save({"model": model_sd}, checkpoint_path)
-                    detail = ", ".join(f"{tt}={score[ckpt_s][tt]:.4f}"
-                                       for tt in TARGET_TYPES if tt in score[ckpt_s])
-                    print(f"Saved best model (cfg={ckpt_s:g}) combined "
-                          f"score: {combined:.4f} ({detail})")
+                    print(f"Saved best model (cfg={ckpt_s:g}) balanced score: "
+                          f"{combined:.4f} over {len(cell_scores)} cells")
 
             if args.log and global_rank == 0:
                 log_dict = {
@@ -726,14 +818,18 @@ def train(local_rank, args):
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 for s in scales:
-                    for tt in TARGET_TYPES:
-                        if tt not in score[s]:
+                    for c in cells:
+                        if c not in score[s]:
                             continue
-                        tag = f"cfg{s:g}_{tt}"
-                        log_dict[f"val_ssim_{tag}"] = avg_ssim[s][tt]
-                        log_dict[f"val_psnr_{tag}"] = avg_psnr[s][tt]
-                        log_dict[f"val_lpips_{tag}"] = avg_lpips[s][tt]
-                        log_dict[f"val_score_{tag}"] = score[s][tt]
+                        a, g = c
+                        tag = f"cfg{s:g}_{a}_{g}"
+                        log_dict[f"val_ssim_{tag}"] = avg_ssim[s][c]
+                        log_dict[f"val_psnr_{tag}"] = avg_psnr[s][c]
+                        log_dict[f"val_lpips_{tag}"] = avg_lpips[s][c]
+                        log_dict[f"val_score_{tag}"] = score[s][c]
+                cell_scores = [score[ckpt_s][c] for c in cells if c in score[ckpt_s]]
+                if cell_scores:
+                    log_dict["val_score_balanced"] = sum(cell_scores) / len(cell_scores)
                 wandb.log(log_dict)
 
             if use_ema:
@@ -741,7 +837,7 @@ def train(local_rank, args):
 
     if global_rank == 0 and args.save_model:
         contrast_tag = "_".join(args.contrast)
-        final_path = f"./checkpoints_s/flow_matching_3d_{contrast_tag}_final.pt"
+        final_path = f"./checkpoints_l/flow_matching_3d_{contrast_tag}_final.pt"
         model_sd = model.module.state_dict() if args.distributed else model.state_dict()
         torch.save({"model": model_sd}, final_path)
 
