@@ -57,8 +57,25 @@ _PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
 _ARTIFACT_SUFFIX_RE = re.compile(
     r"_(?:R\d+|SPIKE_R\d+|ANISO_(?:phase|read|par)\d+(?:\.\d+)?)$"
 )
+
+
+def _artifact_family(suffix: str) -> str:
+    """Coarse artifact family for a sample, from the artifact dir suffix.
+
+    `suffix` is the part of an artifact sibling dir name after the raw
+    subject name, e.g. `_R8`, `_SPIKE_R4`, `_ANISO_phase3.5`. The order of
+    checks matters: `_SPIKE_R*` also contains `R*`, so it is tested first.
+    """
+    if suffix.startswith("_SPIKE_R"):
+        return "spike"
+    if suffix.startswith("_R"):
+        return "undersampled"
+    if suffix.startswith("_ANISO_"):
+        return "aniso"
+    return "unknown"
+
+
 _DENOISED_PREFIX = "md"
-_ANATOMIES = ("brain", "knee", "prostate")
 
 
 def _index_subject_patches(subject_dir: str):
@@ -162,7 +179,7 @@ def build_augmentation(
 
 
 class PatchPairDataset(Dataset):
-    """One sample = (condition patch, target patch, prompt).
+    """One sample = (condition, target, prompt, target_type, anatomy, artifact).
 
     Each volume tensor is shape (1, *patch_shape) (default (1, 192, 192, 16)).
     `prompt` is the target's ready-made text description (see the sidecar
@@ -199,7 +216,7 @@ class PatchPairDataset(Dataset):
         # "raw" = "Fully sampled ..." target, "denoised" = "Denoised and
         # biascorrected ..." target. Used by validation to score both equally.
         target_type = "raw" if s["task"] == "artifact2raw" else "denoised"
-        return condition, target, s["prompt"], target_type
+        return condition, target, s["prompt"], target_type, s["anatomy"], s["artifact"]
 
 
 def _find_artifact_siblings(subjects, raw_name: str):
@@ -272,6 +289,7 @@ def build_samples(data_root: str, split: str, anatomy: str):
 
             # Tasks 1 & 2: artifact -> raw, artifact -> denoised.
             for art in _find_artifact_siblings(subjects, name):
+                art_family = _artifact_family(art[len(name):])
                 art_patches = _index_subject_patches(os.path.join(acq_dir, art))
                 for coord, art_path in art_patches.items():
                     if coord in raw_patches:
@@ -280,6 +298,8 @@ def build_samples(data_root: str, split: str, anatomy: str):
                             "target_path": raw_patches[coord],
                             "prompt": raw_prompt,
                             "task": "artifact2raw",
+                            "anatomy": anatomy,
+                            "artifact": art_family,
                         })
                     if den_prompt is not None and coord in den_patches:
                         samples.append({
@@ -287,6 +307,8 @@ def build_samples(data_root: str, split: str, anatomy: str):
                             "target_path": den_patches[coord],
                             "prompt": den_prompt,
                             "task": "artifact2denoised",
+                            "anatomy": anatomy,
+                            "artifact": art_family,
                         })
 
             # Task 3: raw -> denoised.
@@ -298,6 +320,8 @@ def build_samples(data_root: str, split: str, anatomy: str):
                             "target_path": den_patches[coord],
                             "prompt": den_prompt,
                             "task": "raw2denoised",
+                            "anatomy": anatomy,
+                            "artifact": "clean",
                         })
 
     return samples
@@ -326,9 +350,12 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
     `augment` is an optional TorchIO transform (see `build_augmentation`)
     applied to the *condition only*, on both the train and val datasets.
 
-    The returned datasets carry a `contrast_indices` attribute mapping each
-    anatomy name to the list of dataset indices belonging to it, so a balanced
-    sampler can draw evenly across anatomies.
+    The returned datasets carry two index maps for the balanced sampler:
+      * `contrast_indices` -- keyed by anatomy name, for balancing across
+        anatomies (the default).
+      * `group_indices` -- keyed by the `(anatomy, artifact)` pair, for
+        balancing across every anatomy x artifact group (e.g. equal numbers of
+        undersampled-brain, undersampled-knee, spike-brain, ...).
 
     Train comes from `train/`, validation from `test/`.
     """
@@ -364,23 +391,37 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
         train_samples_all.extend(tr_samples)
         val_samples_all.extend(v_samples)
 
+    def _group_indices(samples):
+        """Map (anatomy, artifact) -> list of dataset indices."""
+        groups = {}
+        for i, s in enumerate(samples):
+            groups.setdefault((s["anatomy"], s["artifact"]), []).append(i)
+        return groups
+
     train_set = PatchPairDataset(train_samples_all,
                                  patch_shape=patch_shape, augment=augment)
     val_set = PatchPairDataset(val_samples_all,
                                patch_shape=patch_shape, augment=augment)
     train_set.contrast_indices = train_contrast_indices
     val_set.contrast_indices = val_contrast_indices
+    train_set.group_indices = _group_indices(train_samples_all)
+    val_set.group_indices = _group_indices(val_samples_all)
     return train_set, val_set
 
 
 class BalancedDistributedSampler(Sampler):
-    """Yields an equal number of samples per anatomy each epoch.
+    """Yields an equal number of samples per group each epoch.
 
-    Each epoch reseeds via `seed + epoch`, so the larger anatomy cycles
-    through different random subsets across epochs. Compatible with DDP via
+    A "group" is whatever the keys of `contrast_indices` are: anatomy names
+    for cross-anatomy balancing, or `(anatomy, artifact)` pairs for
+    cross-(anatomy x artifact) balancing. `samples_per_contrast` is the
+    per-group quota.
+
+    Each epoch reseeds via `seed + epoch`, so larger groups cycle through
+    different random subsets across epochs. Compatible with DDP via
     rank/num_replicas slicing (set `num_replicas=1, rank=0` for non-DDP).
 
-    If `samples_per_contrast` exceeds an anatomy's pool, that anatomy is
+    If `samples_per_contrast` exceeds a group's pool, that group is
     oversampled with replacement to reach the target.
     """
 
@@ -448,6 +489,7 @@ def getloader_3d_patches(
     world_size: int = 1,
     train_shuffle: bool = True,
     samples_per_contrast=None,
+    balance_by: str = "anatomy",
     patch_shape=(192, 192, 16),
     augment=None,
     augment_kwargs=None,
@@ -469,11 +511,22 @@ def getloader_3d_patches(
     `augment` takes precedence if both are given.
 
     If `samples_per_contrast` is not None, training uses
-    `BalancedDistributedSampler`: each anatomy contributes the same number of
-    samples per epoch (0 = auto-balance to the smallest anatomy). The larger
-    anatomy/anatomies cycle through different random subsets across epochs.
+    `BalancedDistributedSampler`: each balancing group contributes the same
+    number of samples per epoch (0 = auto-balance to the smallest group).
+    Larger groups cycle through different random subsets across epochs.
     Validation always uses standard sampling.
+
+    `balance_by` selects the grouping:
+      * "anatomy"          -- equal samples per anatomy (default; mixes the
+                              natural artifact distribution within each anatomy).
+      * "anatomy_artifact" -- equal samples per `(anatomy, artifact)` group,
+                              e.g. 5000 undersampled-brain, 5000 undersampled-
+                              knee, 5000 spike-brain, ... each epoch.
     """
+    if balance_by not in ("anatomy", "anatomy_artifact"):
+        raise ValueError(
+            f"balance_by must be 'anatomy' or 'anatomy_artifact', got {balance_by!r}"
+        )
     if augment is None and augment_kwargs is not None:
         augment = build_augmentation(**augment_kwargs)
 
@@ -484,8 +537,11 @@ def getloader_3d_patches(
     use_balanced = samples_per_contrast is not None
 
     if use_balanced:
+        balance_indices = (train_set.group_indices
+                           if balance_by == "anatomy_artifact"
+                           else train_set.contrast_indices)
         train_sampler = BalancedDistributedSampler(
-            train_set.contrast_indices,
+            balance_indices,
             samples_per_contrast=samples_per_contrast,
             num_replicas=world_size if distributed else 1,
             rank=rank if distributed else 0,
@@ -547,7 +603,7 @@ if __name__ == "__main__":
         batch_size=1, data_root=data_root, contrast=anatomy,
         sample=1.0, num_workers=0, patch_shape=(96, 96, 16),
     )
-    for condition, target, prompts, target_types in train_loader:
+    for condition, target, prompts, target_types, *_ in train_loader:
         print(
             f"condition  {tuple(condition.shape)}  range "
             f"[{condition.min():.4f}, {condition.max():.4f}]\n"
