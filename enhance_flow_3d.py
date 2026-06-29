@@ -19,12 +19,12 @@ prompt), and mixes them as `v_uncond + scale * (v_cond - v_uncond)`.
 Usage:
     # artifact -> fully sampled (raw)
     python enhance_flow_3d.py \
-        --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints/flow_matching_3d_multitask.pt \
-        --input_path flair.nii.gz   \
-        --output_path ./outputs/flair_spike_R3.nii.gz \
-        --prompt "Fully sampled axial 7T brain T2-weighted FLAIR MRI of resolution 0.85 x 0.75 x 1.5 mm." \
-        --num_sampling_steps 1 --euler --fp16 --non_overlap 8 \
-        --guidance_scale 1.5 --compile --planes axial --ras --autocrop
+        --checkpoint_path checkpoints_uncertainty/flow_matching_3d_brain_all_best_epoch_55.pt \
+        --input_path /ix1/tibrahim/jil202/250507-promote_recovery_from_aws/data/PRT191518_2019.12.05/rT2w_FLAIR_lowres.nii.gz   \
+        --output_path ./outputs/flair.nii.gz \
+        --prompt "Fully sampled sagittal 3T brain T2-weighted FLAIR MRI of resolution 0.7 x 0.5 x 0.5 mm." \
+        --num_sampling_steps 2 --euler --fp16 --non_overlap 2 \
+        --guidance_scale 1.5 --compile --planes sagittal --ras --autocrop
 
     # raw (or artifact) -> denoised + bias-corrected, prompt read from a sidecar
     python enhance_flow_3d.py \
@@ -74,10 +74,16 @@ class FlowMatcher(nn.Module):
     `v = v_uncond + scale * (v_cond - v_uncond)`.
     """
 
-    def __init__(self, model, sigma_min=0.001):
+    def __init__(self, model, sigma_min=0.001, amp_enabled=False, amp_device="cuda"):
         super().__init__()
         self.model = model
         self.sigma_min = sigma_min
+        # `--fp16` runs the UNet forwards under bf16 autocast (model stays fp32).
+        # bf16 has fp32's exponent range, so it can't overflow like true fp16
+        # `.half()` does -- some checkpoints' activations exceed fp16's ~65504
+        # ceiling and produce all-NaN (blank) output.
+        self.amp_enabled = amp_enabled
+        self.amp_device = amp_device
 
     @torch.no_grad()
     def _step_input(self, x, condition):
@@ -87,11 +93,18 @@ class FlowMatcher(nn.Module):
     def _v(self, x, condition, t, context, null_context, guidance_scale):
         inp = self._step_input(x, condition)
         timesteps = (t * 999).long()
-        if guidance_scale != 1.0 and null_context is not None:
-            v_cond = self.model(inp, timesteps, context=context)
-            v_uncond = self.model(inp, timesteps, context=null_context)
-            return v_uncond + guidance_scale * (v_cond - v_uncond)
-        return self.model(inp, timesteps, context=context)
+        # UA-Flow checkpoints output 2 channels: [0] velocity mean, [1] log-var.
+        # Plain checkpoints output 1 channel. Channel 0 is the velocity in both.
+        with torch.autocast(device_type=self.amp_device, dtype=torch.bfloat16,
+                            enabled=self.amp_enabled):
+            if guidance_scale != 1.0 and null_context is not None:
+                v_cond = self.model(inp, timesteps, context=context)[:, 0:1]
+                v_uncond = self.model(inp, timesteps, context=null_context)[:, 0:1]
+                v = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                v = self.model(inp, timesteps, context=context)[:, 0:1]
+        # Back to fp32 so the Euler/Heun/RK4 accumulation stays full precision.
+        return v.float()
 
     @torch.no_grad()
     def sample_euler(self, condition, num_steps, device, context=None,
@@ -101,7 +114,7 @@ class FlowMatcher(nn.Module):
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
             v = self._v(x, condition, t, context, null_context, guidance_scale)
-            x = torch.clamp(x + v * dt, -3, 3)
+            x = torch.clamp(x + v * dt, -10, 10)
         return x
 
     @torch.no_grad()
@@ -216,8 +229,7 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
     for ci, z0 in enumerate(tqdm(chunk_starts, desc=desc)):
         input_slab_cpu = padded[:, :, z0:z0 + PATCH_Z]
         condition = input_slab_cpu.unsqueeze(0).unsqueeze(0).to(device)
-        if fp16:
-            condition = condition.half()
+        # condition stays fp32; bf16 autocast inside FlowMatcher handles casting.
 
         torch.manual_seed(seed)
         if device.type == "cuda":
@@ -390,7 +402,11 @@ def parse_args():
     p.add_argument("--rk4", action="store_true")
 
     p.add_argument("--sigma_min", type=float, default=0.001)
-    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--fp16", action="store_true",
+                   help="Run UNet forwards under bf16 autocast (model stays "
+                        "fp32). bf16 has fp32's exponent range, avoiding the "
+                        "fp16 .half() overflow that turns some checkpoints' "
+                        "output into all-NaN/blank volumes.")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--rescale", action="store_true",
                    help="Rescale output back to ~[0, 255] uint16 before save")
@@ -446,17 +462,6 @@ def parse_args():
 
 def load_model(checkpoint_path, device, args):
     text_conditioner = TextConditioner()
-    model = DiffusionModelUNet(
-        spatial_dims=3,
-        in_channels=2,
-        out_channels=1,
-        channels=(128, 256, 512),
-        attention_levels=(False, False, True),
-        num_res_blocks=2,
-        num_head_channels=512,
-        with_conditioning=True,
-        cross_attention_dim=text_conditioner.hidden_size,
-    )
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if not (isinstance(ckpt, dict) and "model" in ckpt):
@@ -464,6 +469,32 @@ def load_model(checkpoint_path, device, args):
             f"Checkpoint at {checkpoint_path} does not contain a 'model' key. "
             f"Re-train with the text-conditioned train_flow.py."
         )
+
+    # Detect the number of output channels from the checkpoint. UA-Flow
+    # (uncertainty) checkpoints have 2 (velocity mean + log-variance); plain
+    # flow-matching checkpoints have 1. The output conv is `out.2.conv.weight`.
+    out_w = None
+    for k in ("out.2.conv.weight", "module.out.2.conv.weight",
+              "_orig_mod.out.2.conv.weight"):
+        if k in ckpt["model"]:
+            out_w = ckpt["model"][k]
+            break
+    out_channels = out_w.shape[0] if out_w is not None else 1
+    if out_channels == 2:
+        print("  detected UA-Flow checkpoint (out_channels=2); using velocity "
+              "mean channel for inference")
+
+    model = DiffusionModelUNet(
+        spatial_dims=3,
+        in_channels=2,
+        out_channels=out_channels,
+        channels=(128, 256, 512),
+        attention_levels=(False, False, True),
+        num_res_blocks=2,
+        num_head_channels=512,
+        with_conditioning=True,
+        cross_attention_dim=text_conditioner.hidden_size,
+    )
     if "context_encoder" in ckpt:
         raise ValueError(
             f"Checkpoint at {checkpoint_path} is from the legacy scalar-context "
@@ -480,8 +511,8 @@ def load_model(checkpoint_path, device, args):
     # RadBERT stays fp32; its output embeddings are cast in build_context_emb.
     text_conditioner.to(device)
 
-    if args.fp16:
-        model = model.half()
+    # `--fp16` no longer half()s the model: it enables bf16 autocast inside
+    # FlowMatcher (set up in main). The model stays fp32 here.
     if args.compile:
         model = torch.compile(model, backend="inductor")
 
@@ -536,7 +567,8 @@ def main():
 
     print(f"Loading checkpoint: {args.checkpoint_path}")
     model, text_conditioner = load_model(args.checkpoint_path, device, args)
-    flow = FlowMatcher(model, sigma_min=args.sigma_min)
+    flow = FlowMatcher(model, sigma_min=args.sigma_min,
+                       amp_enabled=args.fp16, amp_device=device.type)
 
     print(f"Loading input: {args.input_path}")
     orig_img = nib.load(args.input_path)
@@ -569,7 +601,8 @@ def main():
     print(f"  raw shape={raw.shape}, range=[{raw.min():.2f}, {raw.max():.2f}]")
 
     prompt = resolve_prompt(args)
-    ctx_dtype = torch.float16 if args.fp16 else torch.float32
+    # Keep embeddings fp32; bf16 autocast (when --fp16) casts them inside the UNet.
+    ctx_dtype = torch.float32
     print(f"  guidance_scale={args.guidance_scale}")
 
     ctx_emb, null_emb = build_context_emb(
