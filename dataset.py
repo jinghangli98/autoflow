@@ -336,8 +336,25 @@ def _subsample(samples, percent: float, seed: int = 42):
     return rng.sample(samples, n)
 
 
+def _filter_artifacts(samples, artifacts):
+    """Keep samples whose artifact family is selected, plus all clean pairs.
+
+    `artifacts` is an iterable of artifact families to keep (a subset of
+    {undersampled, spike, aniso}). The clean `raw->denoised` task (artifact
+    == "clean") is always retained regardless of the filter, so a specialized
+    model still learns pure denoising alongside artifact removal. Pass
+    `artifacts=None` to disable filtering entirely.
+    """
+    if artifacts is None:
+        return samples
+    allowed = set(artifacts)
+    return [s for s in samples
+            if s["artifact"] in allowed or s["artifact"] == "clean"]
+
+
 def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
-                           patch_shape=(192, 192, 16), augment=None):
+                           patch_shape=(192, 192, 16), augment=None,
+                           artifacts=None):
     """Build train + val datasets for one or more anatomies.
 
     `contrast` is the anatomy group (one of {brain, knee, prostate}) or a
@@ -349,6 +366,11 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
 
     `augment` is an optional TorchIO transform (see `build_augmentation`)
     applied to the *condition only*, on both the train and val datasets.
+
+    `artifacts` optionally restricts which artifact families are used (a subset
+    of {undersampled, spike, aniso}); the clean `raw->denoised` pairs are always
+    kept. `None` (default) keeps every artifact. Applied to both splits, so a
+    specialized model is validated on the same artifacts it trains on (+ clean).
 
     The returned datasets carry two index maps for the balanced sampler:
       * `contrast_indices` -- keyed by anatomy name, for balancing across
@@ -365,17 +387,21 @@ def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
     train_contrast_indices, val_contrast_indices = {}, {}
 
     for c in contrasts:
-        tr_samples = build_samples(data_root, "train", c)
-        v_samples = build_samples(data_root, "test", c)
+        tr_samples = _filter_artifacts(build_samples(data_root, "train", c), artifacts)
+        v_samples = _filter_artifacts(build_samples(data_root, "test", c), artifacts)
 
         for split_name, split_samples in (("train", tr_samples), ("test", v_samples)):
             if not split_samples:
+                art_note = (f" with --artifact {sorted(artifacts)}"
+                            if artifacts is not None else "")
                 raise ValueError(
                     f"No (condition, target) patch pairs found for anatomy "
-                    f"'{c}' in {os.path.join(data_root, split_name, c)}. Check "
-                    f"that raw subject dirs contain patch_*.nii.gz plus a "
+                    f"'{c}'{art_note} in {os.path.join(data_root, split_name, c)}. "
+                    f"Check that raw subject dirs contain patch_*.nii.gz plus a "
                     f"<subject>.json prompt sidecar, and that artifact "
-                    f"(_R*/_SPIKE_R*/_ANISO_*) and md<subject> dirs exist."
+                    f"(_R*/_SPIKE_R*/_ANISO_*) and md<subject> dirs exist. "
+                    f"If filtering by artifact, this anatomy may not carry the "
+                    f"requested family."
                 )
 
         tr_samples = _subsample(tr_samples, sample, seed=42)
@@ -430,8 +456,17 @@ class BalancedDistributedSampler(Sampler):
         if not contrast_indices:
             raise ValueError("contrast_indices is empty")
         self.contrast_indices = {k: list(v) for k, v in contrast_indices.items() if v}
-        if samples_per_contrast is None or samples_per_contrast <= 0:
-            samples_per_contrast = min(len(v) for v in self.contrast_indices.values())
+        # `samples_per_contrast` may be a scalar (same quota for every group) or
+        # a dict {group_key: quota} for per-group quotas, e.g. an up-weighted
+        # aniso group (see `_artifact_fraction_quota`). A scalar <= 0 / None
+        # auto-balances to the smallest group.
+        if isinstance(samples_per_contrast, dict):
+            self.quota = {k: int(samples_per_contrast[k])
+                          for k in self.contrast_indices}
+        else:
+            if samples_per_contrast is None or samples_per_contrast <= 0:
+                samples_per_contrast = min(len(v) for v in self.contrast_indices.values())
+            self.quota = {k: int(samples_per_contrast) for k in self.contrast_indices}
         self.samples_per_contrast = samples_per_contrast
         self.num_replicas = num_replicas
         self.rank = rank
@@ -439,7 +474,7 @@ class BalancedDistributedSampler(Sampler):
         self.seed = seed
         self.epoch = 0
 
-        n_total = samples_per_contrast * len(self.contrast_indices)
+        n_total = sum(self.quota.values())
         self.num_samples = math.ceil(n_total / num_replicas)
         self.total_size = self.num_samples * num_replicas
 
@@ -448,8 +483,8 @@ class BalancedDistributedSampler(Sampler):
         g.manual_seed(self.seed + self.epoch)
 
         indices = []
-        for idxs in self.contrast_indices.values():
-            n = self.samples_per_contrast
+        for key, idxs in self.contrast_indices.items():
+            n = self.quota[key]
             pool = torch.tensor(idxs)
             if n <= len(idxs):
                 perm = torch.randperm(len(idxs), generator=g)[:n]
@@ -478,6 +513,44 @@ class BalancedDistributedSampler(Sampler):
         self.epoch = epoch
 
 
+def _artifact_fraction_quota(group_indices, family, frac, base):
+    """Per-group sample quotas that make `family` a fixed fraction per anatomy.
+
+    `group_indices` maps `(anatomy, artifact)` -> dataset indices. For each
+    anatomy that has the target `family` group alongside >=1 other group, the
+    target group's quota is raised so the family makes up `frac` of that
+    anatomy's epoch samples while every other group keeps `base`:
+
+        target = base * n_other * frac / (1 - frac)
+
+    so e.g. base=2000, family with 3 other groups, frac=0.7 -> target=14000
+    (14000 / 20000 = 0.7). Anatomies without the family (or with only the
+    family) keep `base` for all their groups. Returns
+    `{(anatomy, artifact): quota}`.
+    """
+    if not (0.0 < frac < 1.0):
+        raise ValueError(f"artifact_fraction's fraction must be in (0, 1), got {frac}")
+    if base is None or base <= 0:
+        raise ValueError(
+            "artifact_fraction requires a positive --samples_per_contrast (the "
+            "base quota the up-weighting is computed from)"
+        )
+    by_anatomy = {}
+    for (anatomy, artifact) in group_indices:
+        by_anatomy.setdefault(anatomy, []).append(artifact)
+
+    quota = {}
+    for anatomy, arts in by_anatomy.items():
+        others = [a for a in arts if a != family]
+        has_family = family in arts
+        for a in arts:
+            if a == family and has_family and others:
+                quota[(anatomy, a)] = int(round(base * len(others) * frac / (1.0 - frac)))
+            else:
+                quota[(anatomy, a)] = int(base)
+    return quota
+
+
 def getloader_3d_patches(
     batch_size: int,
     data_root: str,
@@ -493,6 +566,8 @@ def getloader_3d_patches(
     patch_shape=(192, 192, 16),
     augment=None,
     augment_kwargs=None,
+    artifacts=None,
+    artifact_fraction=None,
 ):
     """DataLoaders for 3D NIfTI patch restoration. DDP-aware.
 
@@ -522,6 +597,17 @@ def getloader_3d_patches(
       * "anatomy_artifact" -- equal samples per `(anatomy, artifact)` group,
                               e.g. 5000 undersampled-brain, 5000 undersampled-
                               knee, 5000 spike-brain, ... each epoch.
+
+    `artifacts` optionally restricts which artifact families are used (a subset
+    of {undersampled, spike, aniso}); clean `raw->denoised` pairs are always
+    kept. `None` (default) keeps every artifact. See `get_dataset_3d_patches`.
+
+    `artifact_fraction` optionally up-weights one artifact family to a fixed
+    fraction of each anatomy's per-epoch samples. Pass `(family, frac)`, e.g.
+    `("aniso", 0.7)`: every other group keeps `samples_per_contrast`, and the
+    family's group is enlarged so it makes up `frac` of that anatomy's samples
+    (see `_artifact_fraction_quota`). Requires `balance_by="anatomy_artifact"`
+    and a positive `samples_per_contrast`. `None` (default) keeps equal groups.
     """
     if balance_by not in ("anatomy", "anatomy_artifact"):
         raise ValueError(
@@ -531,7 +617,8 @@ def getloader_3d_patches(
         augment = build_augmentation(**augment_kwargs)
 
     train_set, val_set = get_dataset_3d_patches(
-        data_root, contrast, sample, patch_shape, augment=augment
+        data_root, contrast, sample, patch_shape, augment=augment,
+        artifacts=artifacts,
     )
 
     use_balanced = samples_per_contrast is not None
@@ -540,9 +627,21 @@ def getloader_3d_patches(
         balance_indices = (train_set.group_indices
                            if balance_by == "anatomy_artifact"
                            else train_set.contrast_indices)
+        # Up-weight one artifact family to a fixed per-anatomy fraction by
+        # handing the sampler per-group quotas instead of one scalar.
+        spc = samples_per_contrast
+        if artifact_fraction is not None:
+            if balance_by != "anatomy_artifact":
+                raise ValueError(
+                    "artifact_fraction requires balance_by='anatomy_artifact'"
+                )
+            family, frac = artifact_fraction
+            spc = _artifact_fraction_quota(
+                train_set.group_indices, family, float(frac), samples_per_contrast
+            )
         train_sampler = BalancedDistributedSampler(
             balance_indices,
-            samples_per_contrast=samples_per_contrast,
+            samples_per_contrast=spc,
             num_replicas=world_size if distributed else 1,
             rank=rank if distributed else 0,
             shuffle=train_shuffle,

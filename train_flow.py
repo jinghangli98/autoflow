@@ -254,9 +254,16 @@ def parse_args():
                              "Each spans all of that anatomy's acquisitions and "
                              "the artifact->raw / artifact->denoised / raw->denoised "
                              "restoration tasks.")
+    parser.add_argument("--artifact", type=str, nargs="+", default=None,
+                        choices=["undersampled", "spike", "aniso"],
+                        help="Optional artifact families to train/validate on, "
+                             "e.g. `--artifact aniso` for a specialized "
+                             "anisotropic model. Omit to use all artifacts. "
+                             "The clean raw->denoised task is always kept "
+                             "regardless of this filter.")
 
     # Training
-    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_epochs", type=int, default=100)
@@ -278,7 +285,23 @@ def parse_args():
                              "(anatomy, artifact) group, e.g. 5000 undersampled-"
                              "brain, 5000 spike-brain, 5000 undersampled-knee, "
                              "... each epoch.")
+    parser.add_argument("--artifact_fraction", type=str, nargs=2, default=None,
+                        metavar=("FAMILY", "FRACTION"),
+                        help="Up-weight one artifact family to a fixed fraction "
+                             "of each anatomy's per-epoch samples, e.g. "
+                             "`--artifact_fraction aniso 0.7`. Every other group "
+                             "keeps --samples_per_contrast; the named family's "
+                             "group is enlarged so it makes up FRACTION of that "
+                             "anatomy's samples. Requires --balance_by "
+                             "anatomy_artifact.")
     parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_images_per_group", type=int,
+                        default=mb.MIN_PER_GROUP,
+                        help="Max validation images scored per (anatomy, "
+                             "artifact) group before the val loop exits early. "
+                             "Capped at each group's available count. Raising "
+                             "this validates more images (and costs "
+                             "proportionally more time).")
     parser.add_argument("--save_model", action="store_true")
     parser.add_argument("--fp16", action="store_true",
                         help="Enable bf16 mixed precision")
@@ -320,7 +343,7 @@ def parse_args():
 
     # EMA
     parser.add_argument("--ema_decay", type=float, default=0.9999)
-    parser.add_argument("--ema_start_epoch", type=int, default=99)
+    parser.add_argument("--ema_start_epoch", type=int, default=1)
 
     # Distributed
     parser.add_argument("--distributed", action="store_true")
@@ -334,6 +357,9 @@ def parse_args():
     args = parser.parse_args()
     if args.ckpt_guidance_scale not in args.val_guidance_scales:
         args.val_guidance_scales.append(args.ckpt_guidance_scale)
+    if args.artifact_fraction is not None:
+        family, frac = args.artifact_fraction
+        args.artifact_fraction = (family, float(frac))
     return args
 
 
@@ -443,6 +469,8 @@ def train(local_rank, args):
             num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
             samples_per_contrast=args.samples_per_contrast,
             balance_by=args.balance_by,
+            artifacts=args.artifact,
+            artifact_fraction=args.artifact_fraction,
         )
     else:
         train_loader, val_loader = getloader_3d_patches(
@@ -453,10 +481,21 @@ def train(local_rank, args):
             num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
             samples_per_contrast=args.samples_per_contrast,
             balance_by=args.balance_by,
+            artifacts=args.artifact,
+            artifact_fraction=args.artifact_fraction,
         )
 
     if global_rank == 0:
         print(f"Data loaders created, train: {len(train_loader)}, val: {len(val_loader)}")
+        # Resulting (anatomy, artifact) sample counts, so a mis-specified
+        # --artifact filter (e.g. an anatomy that lacks the requested family)
+        # is obvious immediately.
+        train_groups = Counter(
+            (s["anatomy"], s["artifact"]) for s in train_loader.dataset.samples
+        )
+        print(f"Artifact filter: {args.artifact or 'all'}")
+        for (a, art) in sorted(train_groups):
+            print(f"  train group {a}/{art}: {train_groups[(a, art)]} pairs")
 
     text_conditioner = TextConditioner()
     model = DiffusionModelUNet(
@@ -669,7 +708,8 @@ def train(local_rank, args):
                 (s["anatomy"], s["artifact"]) for s in val_loader.dataset.samples
             )
             present_groups = sorted(val_group_total)            # deterministic order
-            group_target = mb.group_targets(dict(val_group_total))
+            group_target = mb.group_targets(
+                dict(val_group_total), min_per_group=args.val_images_per_group)
             group_seen = {g: 0 for g in present_groups}
             # Breakdown sample-weighted sums, keyed by (scale, anatomy, artifact),
             # pooled over target_type, only at the cfg=0 / cfg=1 scales.
@@ -872,7 +912,8 @@ def train(local_rank, args):
                 if combined > best_score:
                     best_score = combined
                     contrast_tag = "_".join(args.contrast)
-                    checkpoint_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_best_epoch_{epoch}.pt"
+                    artifact_tag = "_".join(sorted(args.artifact)) if args.artifact else "all"
+                    checkpoint_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_best_epoch_{epoch}.pt"
                     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
                     torch.save({"model": model_sd}, checkpoint_path)
@@ -914,7 +955,8 @@ def train(local_rank, args):
 
     if global_rank == 0 and args.save_model:
         contrast_tag = "_".join(args.contrast)
-        final_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_final.pt"
+        artifact_tag = "_".join(sorted(args.artifact)) if args.artifact else "all"
+        final_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_final.pt"
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         model_sd = model.module.state_dict() if args.distributed else model.state_dict()
         torch.save({"model": model_sd}, final_path)
