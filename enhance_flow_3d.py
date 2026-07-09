@@ -19,12 +19,12 @@ prompt), and mixes them as `v_uncond + scale * (v_cond - v_uncond)`.
 Usage:
     # artifact -> fully sampled (raw)
     python enhance_flow_3d.py \
-        --checkpoint_path checkpoints_uncertainty/flow_matching_3d_brain_all_best_epoch_55.pt \
+        --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints_uncertainty/flow_matching_3d_brain_all_best_062926.pt \
         --input_path /ix1/tibrahim/jil202/250507-promote_recovery_from_aws/data/PRT191518_2019.12.05/rT2w_FLAIR_lowres.nii.gz   \
         --output_path ./outputs/flair.nii.gz \
         --prompt "Fully sampled sagittal 3T brain T2-weighted FLAIR MRI of resolution 0.7 x 0.5 x 0.5 mm." \
-        --num_sampling_steps 2 --euler --fp16 --non_overlap 2 \
-        --guidance_scale 1.5 --compile --planes sagittal --ras --autocrop
+        --num_sampling_steps 4 --euler --fp16 --non_overlap 8 \
+        --guidance_scale 1 --compile --planes sagittal --autocrop --ras 
 
     # raw (or artifact) -> denoised + bias-corrected, prompt read from a sidecar
     python enhance_flow_3d.py \
@@ -108,8 +108,8 @@ class FlowMatcher(nn.Module):
 
     @torch.no_grad()
     def sample_euler(self, condition, num_steps, device, context=None,
-                     null_context=None, guidance_scale=1.0):
-        x = torch.randn_like(condition, device=device)
+                     null_context=None, guidance_scale=1.0, noise=None):
+        x = noise if noise is not None else torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
@@ -119,8 +119,8 @@ class FlowMatcher(nn.Module):
 
     @torch.no_grad()
     def sample_heun(self, condition, num_steps, device, context=None,
-                    null_context=None, guidance_scale=1.0):
-        x = torch.randn_like(condition, device=device)
+                    null_context=None, guidance_scale=1.0, noise=None):
+        x = noise if noise is not None else torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
@@ -133,8 +133,8 @@ class FlowMatcher(nn.Module):
 
     @torch.no_grad()
     def sample_rk4(self, condition, num_steps, device, context=None,
-                   null_context=None, guidance_scale=1.0):
-        x = torch.randn_like(condition, device=device)
+                   null_context=None, guidance_scale=1.0, noise=None):
+        x = noise if noise is not None else torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t_cur = torch.full((condition.shape[0],), i * dt, device=device)
@@ -195,15 +195,17 @@ def build_context_emb(text_conditioner, prompt, device, dtype):
 
 
 def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
-                   guidance_scale, non_overlap, fp16, seed, desc="Slabs",
-                   snapshot_idx=None, snapshot_path=None, snapshot_plane=""):
+                   guidance_scale, non_overlap, fp16, seed, batch_size=1,
+                   desc="Slabs", snapshot_idx=None, snapshot_path=None,
+                   snapshot_plane=""):
     """Slide PATCH_Z-thick slabs along the LAST axis of `padded`, run flow
     matching per slab, and blend with overlap-and-add along that axis.
 
-    If `snapshot_idx` is set and `snapshot_path` is not None, the mid-slice
-    (input vs. output) of that slab is saved to disk immediately after that
-    slab is generated -- i.e. before the next slab starts. Index is clamped
-    to the actual number of slabs.
+    Up to `batch_size` slabs are stacked into a single batched forward to
+    amortize kernel-launch / attention overhead. Every slab in a batch is
+    seeded with the *same* noise (seed reset before the batch, then the
+    per-slab noise broadcast across the batch dim), so the output is bit-for-bit
+    identical to the unbatched (`batch_size=1`) path regardless of batch size.
     """
     z_dim = padded.shape[2]
     stride = PATCH_Z - non_overlap
@@ -222,37 +224,35 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
     output_sum = torch.zeros_like(padded)
     output_weight = torch.zeros_like(padded)
 
-    effective_snap_idx = None
-    if snapshot_idx is not None and snapshot_path is not None and len(chunk_starts) > 0:
-        effective_snap_idx = max(0, min(snapshot_idx, len(chunk_starts) - 1))
+    batch_size = max(1, batch_size)
+    for bs in tqdm(range(0, len(chunk_starts), batch_size), desc=desc):
+        batch_z0 = chunk_starts[bs:bs + batch_size]
+        # (B, 1, X, Y, PATCH_Z); fp32 condition, bf16 autocast handles casting.
+        slabs = [padded[:, :, z0:z0 + PATCH_Z] for z0 in batch_z0]
+        condition = torch.stack(slabs, dim=0).unsqueeze(1).to(device)
+        b = condition.shape[0]
 
-    for ci, z0 in enumerate(tqdm(chunk_starts, desc=desc)):
-        input_slab_cpu = padded[:, :, z0:z0 + PATCH_Z]
-        condition = input_slab_cpu.unsqueeze(0).unsqueeze(0).to(device)
-        # condition stays fp32; bf16 autocast inside FlowMatcher handles casting.
-
+        # Match the unbatched path exactly: reseed, draw a single slab's worth
+        # of noise, broadcast it across the batch dim. Cross-attention context
+        # is per-slab identical, so expand it across the batch too.
         torch.manual_seed(seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
+        base_noise = torch.randn((1, *condition.shape[1:]), device=device)
+        noise = base_noise.expand(b, -1, -1, -1, -1)
+        ctx_b = ctx_emb.expand(b, *ctx_emb.shape[1:]) if ctx_emb is not None else None
+        null_b = null_emb.expand(b, *null_emb.shape[1:]) if null_emb is not None else None
 
         gen = sampler(
             condition, num_steps, device,
-            context=ctx_emb, null_context=null_emb,
-            guidance_scale=guidance_scale,
+            context=ctx_b, null_context=null_b,
+            guidance_scale=guidance_scale, noise=noise,
         )
-        gen_chunk_cpu = gen[0, 0].float().cpu()
+        gen_cpu = gen[:, 0].float().cpu()  # (B, X, Y, PATCH_Z)
 
-        # if effective_snap_idx is not None and ci == effective_snap_idx:
-        #     mid = PATCH_Z // 2
-        #     save_slab_snapshot(
-        #         input_slab_cpu[:, :, mid].numpy(),
-        #         gen_chunk_cpu[:, :, mid].numpy(),
-        #         snapshot_path, ci, snapshot_plane,
-        #     )
-        #     print(f"  [{snapshot_plane}] saved slab-{ci + 1} snapshot: {snapshot_path}")
-
-        output_sum[:, :, z0:z0 + PATCH_Z] += gen_chunk_cpu * window
-        output_weight[:, :, z0:z0 + PATCH_Z] += window
+        for i, z0 in enumerate(batch_z0):
+            output_sum[:, :, z0:z0 + PATCH_Z] += gen_cpu[i] * window
+            output_weight[:, :, z0:z0 + PATCH_Z] += window
 
     return output_sum / output_weight.clamp(min=1e-8), len(chunk_starts)
 
@@ -277,7 +277,8 @@ def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
     output_padded, n_chunks = slab_inference(
         padded, sampler, args.num_sampling_steps, device,
         ctx_emb, null_emb, args.guidance_scale,
-        non_overlap, args.fp16, args.seed, desc=f"{plane} slabs",
+        non_overlap, args.fp16, args.seed, batch_size=args.batch_size,
+        desc=f"{plane} slabs",
         snapshot_idx=snapshot_idx, snapshot_path=snapshot_path,
         snapshot_plane=plane,
     )
@@ -391,6 +392,11 @@ def parse_args():
     p.add_argument("--output_path", type=str, required=True)
 
     p.add_argument("--num_sampling_steps", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=1,
+                   help="Number of Z-slabs to stack into a single batched "
+                        "forward pass. >1 amortizes per-slab overhead for a "
+                        "speedup at the cost of more GPU memory. Output is "
+                        "numerically identical to batch_size=1.")
     p.add_argument("--non_overlap", type=int, default=0,
                    help="Number of overlapping slices between consecutive Z-chunks. "
                         "Stride = PATCH_Z - non_overlap. 0 = no overlap (default); "
