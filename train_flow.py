@@ -93,12 +93,21 @@ class TextConditioner(nn.Module):
     `null()` returns the empty-prompt embedding for guided sampling.
     """
 
-    def __init__(self, model_name=TEXT_ENCODER_NAME, max_len=PROMPT_MAX_LEN):
+    def __init__(self, model_name=TEXT_ENCODER_NAME, max_len=PROMPT_MAX_LEN,
+                 trainable=False):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
-        self.encoder.requires_grad_(False)
-        self.encoder.eval()
+        self.trainable = trainable
+        if not trainable:
+            self.encoder.requires_grad_(False)
+            self.encoder.eval()
+        else:
+            # The RoBERTa pooler ([CLS] head) is never used -- we read
+            # last_hidden_state -- so its params get no gradient. Freeze it so
+            # DDP (find_unused_parameters=False) doesn't error on unused params.
+            if getattr(self.encoder, "pooler", None) is not None:
+                self.encoder.pooler.requires_grad_(False)
         self.max_len = max_len
         self.hidden_size = self.encoder.config.hidden_size
 
@@ -109,10 +118,11 @@ class TextConditioner(nn.Module):
         self.register_buffer("null_mask", null_tok.attention_mask, persistent=False)
 
     def train(self, mode=True):
-        # Always stay in eval mode so the encoder's dropout never activates.
-        return super().train(False)
+        # When frozen, always stay in eval mode so the encoder's dropout never
+        # activates. When trainable (fine-tuning), let train()/eval() propagate
+        # normally so RadBERT's dropout is active during training steps.
+        return super().train(mode if self.trainable else False)
 
-    @torch.no_grad()
     def encode(self, prompts, device, cfg_dropout_prob=0.0):
         tok = self.tokenizer(
             list(prompts), padding="max_length", max_length=self.max_len,
@@ -124,7 +134,12 @@ class TextConditioner(nn.Module):
             drop = torch.rand(ids.shape[0], device=device) < cfg_dropout_prob
             ids = torch.where(drop[:, None], self.null_ids, ids)
             mask = torch.where(drop[:, None], self.null_mask, mask)
-        return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+        # Gradients flow into RadBERT only when fine-tuning during a training
+        # step; validation (eval mode) and frozen runs stay grad-free.
+        with torch.set_grad_enabled(self.trainable and self.training):
+            return self.encoder(
+                input_ids=ids, attention_mask=mask
+            ).last_hidden_state
 
     @torch.no_grad()
     def null(self, batch_size: int):
@@ -264,6 +279,24 @@ def parse_args():
 
     # Training
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--no_text_conditioning", dest="text_conditioning",
+                        action="store_false",
+                        help="Remove the text cross-attention pathway entirely: "
+                             "build the UNet with with_conditioning=False (no "
+                             "RadBERT, no cross-attention; spatial self-attention "
+                             "is kept). A true ablation of text conditioning. On "
+                             "by default, reproducing prior runs exactly.")
+    parser.set_defaults(text_conditioning=True)
+    parser.add_argument("--train_text_encoder", action="store_true",
+                        help="Fine-tune the RadBERT text encoder alongside the "
+                             "UNet instead of keeping it frozen. Off by default "
+                             "(frozen), which reproduces prior runs exactly. "
+                             "Ignored under --no_text_conditioning.")
+    parser.add_argument("--text_encoder_lr", type=float, default=1e-5,
+                        help="Learning rate for the RadBERT param group when "
+                             "--train_text_encoder is set (default 1e-5, an "
+                             "order of magnitude below --lr to protect the "
+                             "pretrained weights from catastrophic forgetting).")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_epochs", type=int, default=100)
@@ -285,15 +318,23 @@ def parse_args():
                              "(anatomy, artifact) group, e.g. 5000 undersampled-"
                              "brain, 5000 spike-brain, 5000 undersampled-knee, "
                              "... each epoch.")
-    parser.add_argument("--artifact_fraction", type=str, nargs=2, default=None,
-                        metavar=("FAMILY", "FRACTION"),
-                        help="Up-weight one artifact family to a fixed fraction "
-                             "of each anatomy's per-epoch samples, e.g. "
-                             "`--artifact_fraction aniso 0.7`. Every other group "
-                             "keeps --samples_per_contrast; the named family's "
-                             "group is enlarged so it makes up FRACTION of that "
-                             "anatomy's samples. Requires --balance_by "
+    parser.add_argument("--artifact_fraction", type=str, nargs="+", default=None,
+                        metavar="FAMILY [FRACTION] [ANAT=FRAC ...]",
+                        help="Up-weight one artifact family within each anatomy's "
+                             "per-epoch samples. Scalar form `aniso 0.7` (every "
+                             "anatomy) is unchanged; per-anatomy form `aniso 0.7 "
+                             "brain=0.1` sets brain=10%% and others=70%%; "
+                             "`aniso brain=0.1 knee=0.4` lists only those (unlisted "
+                             "anatomy stays uniform). Requires --balance_by "
                              "anatomy_artifact.")
+    parser.add_argument("--anatomy_weight", type=str, nargs="+", default=None,
+                        metavar="ANAT=FRAC",
+                        help="Target epoch fraction per anatomy, e.g. "
+                             "`--anatomy_weight brain=0.1 knee=0.45 prostate=0.45`. "
+                             "Must cover every --contrast anatomy and sum to 1.0. "
+                             "The epoch is re-divided to these fractions (artifacts "
+                             "uniform within each anatomy unless --artifact_fraction "
+                             "also skews them). Omit for equal groups.")
     parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--val_images_per_group", type=int,
                         default=mb.MIN_PER_GROUP,
@@ -357,9 +398,9 @@ def parse_args():
     args = parser.parse_args()
     if args.ckpt_guidance_scale not in args.val_guidance_scales:
         args.val_guidance_scales.append(args.ckpt_guidance_scale)
-    if args.artifact_fraction is not None:
-        family, frac = args.artifact_fraction
-        args.artifact_fraction = (family, float(frac))
+    from dataset import parse_artifact_fraction, parse_anatomy_weight
+    args.artifact_fraction = parse_artifact_fraction(args.artifact_fraction)
+    args.anatomy_weight = parse_anatomy_weight(args.anatomy_weight)
     return args
 
 
@@ -471,6 +512,7 @@ def train(local_rank, args):
             balance_by=args.balance_by,
             artifacts=args.artifact,
             artifact_fraction=args.artifact_fraction,
+            anatomy_weight=args.anatomy_weight,
         )
     else:
         train_loader, val_loader = getloader_3d_patches(
@@ -483,6 +525,7 @@ def train(local_rank, args):
             balance_by=args.balance_by,
             artifacts=args.artifact,
             artifact_fraction=args.artifact_fraction,
+            anatomy_weight=args.anatomy_weight,
         )
 
     if global_rank == 0:
@@ -497,17 +540,29 @@ def train(local_rank, args):
         for (a, art) in sorted(train_groups):
             print(f"  train group {a}/{art}: {train_groups[(a, art)]} pairs")
 
-    text_conditioner = TextConditioner()
+    if not args.text_conditioning and args.train_text_encoder:
+        # No encoder exists to train; the flags are contradictory.
+        if global_rank == 0:
+            print("warning: --train_text_encoder ignored because "
+                  "--no_text_conditioning removes the text encoder.")
+        args.train_text_encoder = False
+
+    # With --no_text_conditioning the model drops the text cross-attention
+    # pathway entirely (with_conditioning=False, no RadBERT). Spatial
+    # self-attention at the deepest level is still present.
+    text_conditioner = (TextConditioner(trainable=args.train_text_encoder)
+                        if args.text_conditioning else None)
+    cross_dim = text_conditioner.hidden_size if text_conditioner is not None else None
     model = DiffusionModelUNet(
         spatial_dims=3,
         in_channels=2,
         out_channels=2,  # [0] velocity mean, [1] velocity log-variance
-        channels=(128, 256, 512),
+        channels=(96, 128, 256), #original 128, 256, 512 -> 96 128 256
         attention_levels=(False, False, True),
         num_res_blocks=2,
-        num_head_channels=512,
-        with_conditioning=True,
-        cross_attention_dim=text_conditioner.hidden_size,
+        num_head_channels=256,
+        with_conditioning=args.text_conditioning,
+        cross_attention_dim=cross_dim,
     )
 
     if os.path.exists(args.checkpoint_path):
@@ -562,6 +617,13 @@ def train(local_rank, args):
         if isinstance(ckpt, dict) and "model" in ckpt:
             model_sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
             _load_relaxed(model, model_sd, "model")
+            if "text_encoder" in ckpt and text_conditioner is not None:
+                enc_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v
+                          for k, v in ckpt["text_encoder"].items()}
+                text_conditioner.encoder.load_state_dict(enc_sd, strict=False)
+                if global_rank == 0:
+                    print("Loaded fine-tuned RadBERT text encoder weights from "
+                          "checkpoint.")
             if "context_encoder" in ckpt and global_rank == 0:
                 print("Ignoring legacy context_encoder weights (scalar-context "
                       "model); text conditioning uses frozen RadBERT.")
@@ -571,7 +633,8 @@ def train(local_rank, args):
             _load_relaxed(model, state_dict, "model")
 
     model.to(device)
-    text_conditioner.to(device)
+    if text_conditioner is not None:
+        text_conditioner.to(device)
 
     if args.compile:
         model = torch.compile(model)
@@ -584,11 +647,30 @@ def train(local_rank, args):
             dist.barrier()
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         flow_matcher.model = model
+        if args.train_text_encoder:
+            # Sync RadBERT gradients across ranks. All encoder params are used
+            # every step, so find_unused_parameters stays False.
+            text_conditioner.encoder = DDP(
+                text_conditioner.encoder, device_ids=[local_rank],
+                output_device=local_rank, find_unused_parameters=False,
+            )
 
-    optimizer = torch.optim.AdamW(
-        params=model.parameters(),
-        lr=args.lr, weight_decay=0.01,
-    )
+    if args.train_text_encoder:
+        # Two param groups: UNet at --lr, RadBERT at the lower --text_encoder_lr.
+        # CosineAnnealingLR anneals both proportionally.
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": model.parameters(), "lr": args.lr},
+                {"params": text_conditioner.encoder.parameters(),
+                 "lr": args.text_encoder_lr},
+            ],
+            weight_decay=0.01,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            params=model.parameters(),
+            lr=args.lr, weight_decay=0.01,
+        )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.max_epochs, eta_min=1e-6,
     )
@@ -613,6 +695,8 @@ def train(local_rank, args):
             ema.register()
 
         model.train()
+        if text_conditioner is not None:
+            text_conditioner.train()  # no-op when the encoder is frozen
         epoch_loss = 0
 
         if global_rank == 0:
@@ -629,9 +713,9 @@ def train(local_rank, args):
 
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.fp16):
                 x0 = torch.randn_like(target)
-                ctx_emb = text_conditioner.encode(
+                ctx_emb = (text_conditioner.encode(
                     prompts, device, cfg_dropout_prob=args.cfg_dropout_prob,
-                )
+                ) if text_conditioner is not None else None)
                 loss = flow_matcher(
                     x0=x0, x1=target,
                     condition=condition, t=t,
@@ -654,7 +738,10 @@ def train(local_rank, args):
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            clip_params = list(model.parameters())
+            if args.train_text_encoder:
+                clip_params += list(text_conditioner.encoder.parameters())
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -687,8 +774,12 @@ def train(local_rank, args):
                 ema.apply_shadow()
 
             model.eval()
+            if text_conditioner is not None:
+                text_conditioner.eval()  # no-op when the encoder is frozen
 
-            scales = args.val_guidance_scales
+            # Without text conditioning, CFG is meaningless: collapse to a single
+            # unconditional pass at scale 1.0.
+            scales = args.val_guidance_scales if args.text_conditioning else [1.0]
             # Per-(scale, target_type) sample-weighted sums of central-slice
             # metrics. Splitting by target_type lets checkpoint selection weight
             # the "Fully sampled" (raw) and "Denoised and biascorrected"
@@ -722,8 +813,12 @@ def train(local_rank, args):
             for i, (condition, target, prompts, target_types, anatomies, artifacts) in enumerate(val_loader):
                 condition = condition.to(device)
                 target = target.to(device)
-                ctx_emb = text_conditioner.encode(prompts, device)
-                null_emb = text_conditioner.null(len(prompts))
+                if text_conditioner is not None:
+                    ctx_emb = text_conditioner.encode(prompts, device)
+                    null_emb = text_conditioner.null(len(prompts))
+                else:
+                    ctx_emb = None
+                    null_emb = None
 
                 # Indices in this batch belonging to each target type.
                 idx_by_tt = {
@@ -901,7 +996,7 @@ def train(local_rank, args):
                               f"LPIPS: {bd_lpips[(sc, a, art)] / n:.4f}, "
                               f"n: {int(n)}")
 
-            ckpt_s = args.ckpt_guidance_scale
+            ckpt_s = args.ckpt_guidance_scale if args.text_conditioning else 1.0
             if global_rank == 0 and args.save_model:
                 # Mean of the per-target-type balanced scores: the "Fully
                 # sampled" and "Denoised and biascorrected" capabilities count
@@ -913,10 +1008,17 @@ def train(local_rank, args):
                     best_score = combined
                     contrast_tag = "_".join(args.contrast)
                     artifact_tag = "_".join(sorted(args.artifact)) if args.artifact else "all"
-                    checkpoint_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_best_epoch_{epoch}.pt"
+                    checkpoint_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_best.pt"
                     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
                     model_sd = model.module.state_dict() if args.distributed else model.state_dict()
-                    torch.save({"model": model_sd}, checkpoint_path)
+                    ckpt_obj = {"model": model_sd}
+                    if args.train_text_encoder:
+                        enc = text_conditioner.encoder
+                        ckpt_obj["text_encoder"] = (
+                            enc.module.state_dict() if args.distributed
+                            else enc.state_dict()
+                        )
+                    torch.save(ckpt_obj, checkpoint_path)
                     detail = ", ".join(f"{tt}={score[ckpt_s][tt]:.4f}"
                                        for tt in TARGET_TYPES if tt in score[ckpt_s])
                     print(f"Saved best model (cfg={ckpt_s:g}) combined "
@@ -959,7 +1061,14 @@ def train(local_rank, args):
         final_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_final.pt"
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         model_sd = model.module.state_dict() if args.distributed else model.state_dict()
-        torch.save({"model": model_sd}, final_path)
+        ckpt_obj = {"model": model_sd}
+        if args.train_text_encoder:
+            enc = text_conditioner.encoder
+            ckpt_obj["text_encoder"] = (
+                enc.module.state_dict() if args.distributed
+                else enc.state_dict()
+            )
+        torch.save(ckpt_obj, final_path)
 
     if args.distributed:
         dist.barrier()

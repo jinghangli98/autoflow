@@ -16,6 +16,16 @@ Classifier-free guidance is enabled with `--guidance_scale > 1.0`. Each ODE
 step then runs two forwards: conditional + unconditional (encoded empty
 prompt), and mixes them as `v_uncond + scale * (v_cond - v_uncond)`.
 
+`--save_uncertainty_map` additionally writes the model's per-voxel predictive
+uncertainty to `<output>_uncertainty.nii.gz` (and `<output>_<plane>_uncertainty
+.nii.gz` per plane when ensembling). It requires a UA-Flow 2-channel checkpoint,
+whose channel 1 is the velocity log-variance; the map is the std obtained by
+propagating that variance through the ODE steps,
+`sqrt(sum_i dt^2 * sigma_v(t_i)^2)`, as in train_flow_sigma.py. It is always
+float32 and is never `--rescale`d or `--hist`-matched: it lives in normalized
+velocity units, not the input's intensity units. Larger values mark voxels the
+model is least sure about -- useful for flagging hallucinated structure.
+
 Usage:
     # artifact -> fully sampled (raw)
     python enhance_flow_3d.py \
@@ -24,7 +34,16 @@ Usage:
         --output_path ./outputs/flair.nii.gz \
         --prompt "Fully sampled sagittal 3T brain T2-weighted FLAIR MRI of resolution 0.7 x 0.5 x 0.5 mm." \
         --num_sampling_steps 4 --euler --fp16 --non_overlap 8 \
-        --guidance_scale 1 --compile --planes sagittal --autocrop --ras 
+        --guidance_scale 1 --compile --planes sagittal --autocrop --ras
+
+    # same, also writing ./outputs/flair_uncertainty.nii.gz
+    python enhance_flow_3d.py \
+        --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints_uncertainty/flow_matching_3d_brain_all_best_062926.pt \
+        --input_path /vast/tibrahim/jil202/autoflow/rT1w_BRAVO_lowres.nii.gz \
+        --output_path ./outputs/BRAVO.nii.gz \
+        --prompt "Fully sampled axial 3T brain T1-weighted BRAVO MRI of resolution 0.85 x 0.85 x 1.2 mm." \
+        --num_sampling_steps 4 --euler --fp16 --planes axial --non_overlap 8 --rescale \
+        --save_uncertainty_map
 
     # raw (or artifact) -> denoised + bias-corrected, prompt read from a sidecar
     python enhance_flow_3d.py \
@@ -74,10 +93,15 @@ class FlowMatcher(nn.Module):
     `v = v_uncond + scale * (v_cond - v_uncond)`.
     """
 
-    def __init__(self, model, sigma_min=0.001, amp_enabled=False, amp_device="cuda"):
+    def __init__(self, model, sigma_min=0.001, amp_enabled=False, amp_device="cuda",
+                 logvar_clamp=7.0):
         super().__init__()
         self.model = model
         self.sigma_min = sigma_min
+        # UA-Flow checkpoints predict a per-voxel velocity log-variance (channel
+        # 1). It is clamped to +/-logvar_clamp before exp() during uncertainty
+        # accumulation, matching train_flow_sigma.py's heteroscedastic head.
+        self.logvar_clamp = logvar_clamp
         # `--fp16` runs the UNet forwards under bf16 autocast (model stays fp32).
         # bf16 has fp32's exponent range, so it can't overflow like true fp16
         # `.half()` does -- some checkpoints' activations exceed fp16's ~65504
@@ -90,7 +114,16 @@ class FlowMatcher(nn.Module):
         return torch.cat([x, condition], dim=1)
 
     @torch.no_grad()
-    def _v(self, x, condition, t, context, null_context, guidance_scale):
+    def _v(self, x, condition, t, context, null_context, guidance_scale,
+           return_logvar=False):
+        """Velocity at (x, t). With `return_logvar`, also returns the predicted
+        per-voxel velocity log-variance (None for 1-channel checkpoints).
+
+        Which branch's log-variance is returned mirrors train_flow_sigma.py's
+        `_guided_velocity`: the conditional branch's, except at
+        `guidance_scale == 0.0` (a pure unconditional eval), where the
+        unconditional branch's is the one that describes the velocity used.
+        """
         inp = self._step_input(x, condition)
         timesteps = (t * 999).long()
         # UA-Flow checkpoints output 2 channels: [0] velocity mean, [1] log-var.
@@ -98,47 +131,88 @@ class FlowMatcher(nn.Module):
         with torch.autocast(device_type=self.amp_device, dtype=torch.bfloat16,
                             enabled=self.amp_enabled):
             if guidance_scale != 1.0 and null_context is not None:
-                v_cond = self.model(inp, timesteps, context=context)[:, 0:1]
-                v_uncond = self.model(inp, timesteps, context=null_context)[:, 0:1]
+                out_c = self.model(inp, timesteps, context=context)
+                out_u = self.model(inp, timesteps, context=null_context)
+                v_cond, v_uncond = out_c[:, 0:1], out_u[:, 0:1]
                 v = v_uncond + guidance_scale * (v_cond - v_uncond)
+                out_lv = out_u if guidance_scale == 0.0 else out_c
             else:
-                v = self.model(inp, timesteps, context=context)[:, 0:1]
+                out_c = self.model(inp, timesteps, context=context)
+                v = out_c[:, 0:1]
+                out_lv = out_c
         # Back to fp32 so the Euler/Heun/RK4 accumulation stays full precision.
-        return v.float()
+        if not return_logvar:
+            return v.float()
+        logvar = out_lv[:, 1:2].float() if out_lv.shape[1] > 1 else None
+        return v.float(), logvar
+
+    def _accum_var(self, var_accum, logvar, dt):
+        """Propagate one Euler step's velocity variance: Var += dt^2 * sigma_v^2.
+        Matches train_flow_sigma.py's `sample`, whose final uncertainty is
+        sqrt(Var). No-op when the checkpoint has no variance head."""
+        if logvar is None:
+            return var_accum
+        return var_accum + (dt ** 2) * torch.exp(
+            logvar.clamp(-self.logvar_clamp, self.logvar_clamp)
+        )
 
     @torch.no_grad()
     def sample_euler(self, condition, num_steps, device, context=None,
-                     null_context=None, guidance_scale=1.0, noise=None):
+                     null_context=None, guidance_scale=1.0, noise=None,
+                     return_uncertainty=False):
         x = noise if noise is not None else torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
+        var_accum = torch.zeros_like(x) if return_uncertainty else None
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
-            v = self._v(x, condition, t, context, null_context, guidance_scale)
+            if return_uncertainty:
+                v, logvar = self._v(x, condition, t, context, null_context,
+                                    guidance_scale, return_logvar=True)
+                var_accum = self._accum_var(var_accum, logvar, dt)
+            else:
+                v = self._v(x, condition, t, context, null_context, guidance_scale)
             x = torch.clamp(x + v * dt, -10, 10)
-        return x
+        return (x, var_accum.sqrt()) if return_uncertainty else x
 
     @torch.no_grad()
     def sample_heun(self, condition, num_steps, device, context=None,
-                    null_context=None, guidance_scale=1.0, noise=None):
+                    null_context=None, guidance_scale=1.0, noise=None,
+                    return_uncertainty=False):
         x = noise if noise is not None else torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
+        var_accum = torch.zeros_like(x) if return_uncertainty else None
         for i in range(num_steps):
             t = torch.full((condition.shape[0],), i * dt, device=device)
-            v1 = self._v(x, condition, t, context, null_context, guidance_scale)
+            if return_uncertainty:
+                # Accumulate from the on-trajectory eval at t_i (the same point
+                # Euler uses); the predictor eval at t_{i+1} is off-trajectory.
+                v1, logvar = self._v(x, condition, t, context, null_context,
+                                     guidance_scale, return_logvar=True)
+                var_accum = self._accum_var(var_accum, logvar, dt)
+            else:
+                v1 = self._v(x, condition, t, context, null_context, guidance_scale)
             x_euler = torch.clamp(x + v1 * dt, -3, 3)
             t_next = torch.full((condition.shape[0],), min((i + 1) * dt, 1.0), device=device)
             v2 = self._v(x_euler, condition, t_next, context, null_context, guidance_scale)
             x = torch.clamp(x + dt * (v1 + v2) / 2.0, -3, 3)
-        return x
+        return (x, var_accum.sqrt()) if return_uncertainty else x
 
     @torch.no_grad()
     def sample_rk4(self, condition, num_steps, device, context=None,
-                   null_context=None, guidance_scale=1.0, noise=None):
+                   null_context=None, guidance_scale=1.0, noise=None,
+                   return_uncertainty=False):
         x = noise if noise is not None else torch.randn_like(condition, device=device)
         dt = 1.0 / num_steps
+        var_accum = torch.zeros_like(x) if return_uncertainty else None
         for i in range(num_steps):
             t_cur = torch.full((condition.shape[0],), i * dt, device=device)
-            k1 = self._v(x, condition, t_cur, context, null_context, guidance_scale)
+            if return_uncertainty:
+                # Accumulate from k1, the only on-trajectory eval of the step.
+                k1, logvar = self._v(x, condition, t_cur, context, null_context,
+                                     guidance_scale, return_logvar=True)
+                var_accum = self._accum_var(var_accum, logvar, dt)
+            else:
+                k1 = self._v(x, condition, t_cur, context, null_context, guidance_scale)
             t_mid = torch.full((condition.shape[0],), i * dt + 0.5 * dt, device=device)
             k2 = self._v(torch.clamp(x + 0.5 * dt * k1, -3, 3), condition,
                          t_mid, context, null_context, guidance_scale)
@@ -148,7 +222,7 @@ class FlowMatcher(nn.Module):
             k4 = self._v(torch.clamp(x + dt * k3, -3, 3), condition,
                          t_next, context, null_context, guidance_scale)
             x = torch.clamp(x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0, -3, 3)
-        return x
+        return (x, var_accum.sqrt()) if return_uncertainty else x
 
 
 # Per-plane permutations that move the slab axis to the LAST dim of an
@@ -197,7 +271,7 @@ def build_context_emb(text_conditioner, prompt, device, dtype):
 def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
                    guidance_scale, non_overlap, fp16, seed, batch_size=1,
                    desc="Slabs", snapshot_idx=None, snapshot_path=None,
-                   snapshot_plane=""):
+                   snapshot_plane="", return_uncertainty=False):
     """Slide PATCH_Z-thick slabs along the LAST axis of `padded`, run flow
     matching per slab, and blend with overlap-and-add along that axis.
 
@@ -206,6 +280,10 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
     seeded with the *same* noise (seed reset before the batch, then the
     per-slab noise broadcast across the batch dim), so the output is bit-for-bit
     identical to the unbatched (`batch_size=1`) path regardless of batch size.
+
+    Returns `(output, n_chunks, uncertainty)`. `uncertainty` is None unless
+    `return_uncertainty`, in which case it is the per-voxel predictive std,
+    blended with the same window as the output.
     """
     z_dim = padded.shape[2]
     stride = PATCH_Z - non_overlap
@@ -223,6 +301,7 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
 
     output_sum = torch.zeros_like(padded)
     output_weight = torch.zeros_like(padded)
+    unc_sum = torch.zeros_like(padded) if return_uncertainty else None
 
     batch_size = max(1, batch_size)
     for bs in tqdm(range(0, len(chunk_starts), batch_size), desc=desc):
@@ -247,14 +326,23 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
             condition, num_steps, device,
             context=ctx_b, null_context=null_b,
             guidance_scale=guidance_scale, noise=noise,
+            return_uncertainty=return_uncertainty,
         )
+        unc_cpu = None
+        if return_uncertainty:
+            gen, unc = gen
+            unc_cpu = unc[:, 0].float().cpu()
         gen_cpu = gen[:, 0].float().cpu()  # (B, X, Y, PATCH_Z)
 
         for i, z0 in enumerate(batch_z0):
             output_sum[:, :, z0:z0 + PATCH_Z] += gen_cpu[i] * window
             output_weight[:, :, z0:z0 + PATCH_Z] += window
+            if unc_cpu is not None:
+                unc_sum[:, :, z0:z0 + PATCH_Z] += unc_cpu[i] * window
 
-    return output_sum / output_weight.clamp(min=1e-8), len(chunk_starts)
+    weight = output_weight.clamp(min=1e-8)
+    unc_out = (unc_sum / weight) if unc_sum is not None else None
+    return output_sum / weight, len(chunk_starts), unc_out
 
 
 def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
@@ -265,7 +353,13 @@ def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
 
     `ctx_emb`/`null_emb` are shared across planes: training built the prompt
     from the params JSON's voxel order regardless of patch orientation.
+
+    Returns `(output, uncertainty)`, both in (X, Y, Z); `uncertainty` is None
+    unless `args.save_uncertainty_map`. `getattr` guards the flag because other
+    scripts (evaluate_test_whole.py, ablate_prompt_conditioning.py) call this
+    with their own argparse namespaces, which do not define it.
     """
+    want_unc = getattr(args, "save_uncertainty_map", False)
     perm, inv_perm = PLANE_PERMS[plane]
     permuted = vol_t.permute(*perm).contiguous()
 
@@ -274,18 +368,23 @@ def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
     print(f"  [{plane}] permuted shape={tuple(permuted.shape)}, "
           f"padded shape={tuple(padded.shape)}")
 
-    output_padded, n_chunks = slab_inference(
+    output_padded, n_chunks, unc_padded = slab_inference(
         padded, sampler, args.num_sampling_steps, device,
         ctx_emb, null_emb, args.guidance_scale,
         non_overlap, args.fp16, args.seed, batch_size=args.batch_size,
         desc=f"{plane} slabs",
         snapshot_idx=snapshot_idx, snapshot_path=snapshot_path,
         snapshot_plane=plane,
+        return_uncertainty=want_unc,
     )
     print(f"  [{plane}] n_slabs={n_chunks}")
 
-    out_unpadded = unpad(output_padded, pad_info, original_shape)
-    return out_unpadded.permute(*inv_perm).contiguous()
+    out = unpad(output_padded, pad_info, original_shape).permute(*inv_perm).contiguous()
+    unc = None
+    if unc_padded is not None:
+        unc = unpad(unc_padded, pad_info, original_shape).permute(*inv_perm).contiguous()
+        print(f"  [{plane}] uncertainty: mean={unc.mean():.4f}, max={unc.max():.4f}")
+    return out, unc
 
 
 def match_histograms(source, reference):
@@ -339,7 +438,8 @@ def split_nii_ext(path):
 
 
 def save_volume(volume_t, path, to_orig_ornt, rescale, ref_img,
-                hist_match_ref=None, repad_bounds=None, pre_crop_shape=None):
+                hist_match_ref=None, repad_bounds=None, pre_crop_shape=None,
+                dtype=None):
     """Post-process and save: optional repad-from-autocrop, reorient back to
     the input's native orientation, histogram match, or uint8 rescale.
 
@@ -348,6 +448,12 @@ def save_volume(volume_t, path, to_orig_ornt, rescale, ref_img,
 
     `hist_match_ref` (if given) overrides `rescale`: the output's intensity
     CDF is matched to the reference array's CDF and saved as float32.
+
+    `dtype` forces the on-disk datatype instead of inheriting `ref_img`'s. The
+    inherited header is what nibabel writes with, so a float volume under an
+    int16 input header would otherwise be stored as int16 + an scl_slope --
+    lossy. Pass np.float32 for volumes that are not in the input's intensity
+    units (e.g. the uncertainty map).
     """
     arr = volume_t.numpy() if torch.is_tensor(volume_t) else volume_t
     if repad_bounds is not None and pre_crop_shape is not None:
@@ -360,8 +466,25 @@ def save_volume(volume_t, path, to_orig_ornt, rescale, ref_img,
         arr = np.rint(np.clip(arr * 255.0, 0, 255)).astype(np.uint8)
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     out_img = nib.Nifti1Image(arr, ref_img.affine, ref_img.header)
+    if dtype is not None:
+        out_img.set_data_dtype(dtype)
     out_img.to_filename(path)
     print(f"Saved: {path}")
+
+
+def save_uncertainty(unc_t, path, to_orig_ornt, ref_img,
+                     repad_bounds=None, pre_crop_shape=None):
+    """Save a per-voxel predictive-uncertainty (std) map alongside the output.
+
+    It shares the output's geometry (same repad + reorient), so it overlays
+    voxel-for-voxel. It is deliberately never `--rescale`d or histogram-matched:
+    those map into the input's *intensity* units, while this map is a std in
+    normalized-velocity units. Forced to float32 so the input's (possibly
+    integer) header does not quantize it.
+    """
+    save_volume(unc_t, path, to_orig_ornt, rescale=False, ref_img=ref_img,
+                hist_match_ref=None, repad_bounds=repad_bounds,
+                pre_crop_shape=pre_crop_shape, dtype=np.float32)
 
 
 def save_slab_snapshot(input_slice, output_slice, path, slab_idx, plane):
@@ -416,10 +539,19 @@ def parse_args():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--rescale", action="store_true",
                    help="Rescale output back to ~[0, 255] uint16 before save")
+    p.add_argument("--norm_div", type=float, default=None,
+                   help="Fixed divisor to normalize input into the model's "
+                        "expected range. Default (None) divides by the input's "
+                        "own max (whole-volume behavior). Set to 1.0 for "
+                        "pre-normalized patches to feed them through unchanged.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
 
-    g = p.add_mutually_exclusive_group(required=True)
+    # Not required: unconditioned checkpoints (trained with
+    # --no_text_conditioning) take no prompt. For conditioned checkpoints a
+    # prompt IS required -- validated in main() after the checkpoint type is
+    # auto-detected.
+    g = p.add_mutually_exclusive_group(required=False)
     g.add_argument("--prompt", type=str, default=None,
                    help="Target text prompt (the cross-attention context that "
                         "selects the output), e.g. \"Fully sampled axial 7T "
@@ -430,7 +562,7 @@ def parse_args():
                         "<subject>.json format) to read the target prompt from.")
 
     # Classifier-free guidance
-    p.add_argument("--guidance_scale", type=float, default=1.5,
+    p.add_argument("--guidance_scale", type=float, default=1,
                    help="Classifier-free guidance scale. 1.0 = no guidance "
                         "(single forward); >1.0 doubles per-step model evals.")
 
@@ -450,6 +582,19 @@ def parse_args():
     p.add_argument("--no_snapshot", action="store_true",
                    help="Disable per-slab snapshots.")
 
+    # Both spellings accepted: the file's convention is underscores, but the
+    # dashed form is the reflex for anyone used to standard CLI tools.
+    p.add_argument("--save_uncertainty_map", "--save-uncertainty-map",
+                   dest="save_uncertainty_map", action="store_true",
+                   help="Also save the model's per-voxel predictive uncertainty "
+                        "(std) map, obtained by propagating the variance head's "
+                        "sigma_v through the ODE steps: sqrt(sum_i dt^2 * "
+                        "sigma_v(t_i)^2). Requires a UA-Flow 2-channel "
+                        "checkpoint. Written next to --output_path as "
+                        "<output>_uncertainty.nii.gz, always float32 (never "
+                        "--rescale'd or --hist-matched, since it is in "
+                        "normalized-velocity units, not intensity units).")
+
     p.add_argument("--ras", action="store_true",
                    help="Reorient the input to closest-canonical RAS+ before "
                         "inference, then reorient the output back to the "
@@ -467,14 +612,21 @@ def parse_args():
 
 
 def load_model(checkpoint_path, device, args):
-    text_conditioner = TextConditioner()
-
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if not (isinstance(ckpt, dict) and "model" in ckpt):
         raise ValueError(
             f"Checkpoint at {checkpoint_path} does not contain a 'model' key. "
             f"Re-train with the text-conditioned train_flow.py."
         )
+
+    # Auto-detect whether the checkpoint has the text cross-attention pathway.
+    # Conditioned models (SpatialTransformer) carry `attn2` params; models
+    # trained with --no_text_conditioning (self-attention only) do not. The
+    # substring survives any `module.`/`_orig_mod.` prefix.
+    has_cross = any("attn2" in k for k in ckpt["model"])
+    text_conditioner = TextConditioner() if has_cross else None
+    cross_dim = text_conditioner.hidden_size if text_conditioner is not None else None
+    print(f"  text conditioning: {'ON (RadBERT cross-attention)' if has_cross else 'OFF (unconditioned checkpoint)'}")
 
     # Detect the number of output channels from the checkpoint. UA-Flow
     # (uncertainty) checkpoints have 2 (velocity mean + log-variance); plain
@@ -498,10 +650,10 @@ def load_model(checkpoint_path, device, args):
         attention_levels=(False, False, True),
         num_res_blocks=2,
         num_head_channels=512,
-        with_conditioning=True,
-        cross_attention_dim=text_conditioner.hidden_size,
+        with_conditioning=has_cross,
+        cross_attention_dim=cross_dim,
     )
-    if "context_encoder" in ckpt:
+    if has_cross and "context_encoder" in ckpt:
         raise ValueError(
             f"Checkpoint at {checkpoint_path} is from the legacy scalar-context "
             f"model (cross_attention_dim=256); it is incompatible with the "
@@ -513,16 +665,26 @@ def load_model(checkpoint_path, device, args):
     model_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
     model.load_state_dict(model_sd)
 
+    # Checkpoints trained with --train_text_encoder carry fine-tuned RadBERT
+    # weights; load them over the pretrained ones. Absent this key the encoder
+    # stays the stock frozen RadBERT. It is eval/frozen at inference either way.
+    if text_conditioner is not None and "text_encoder" in ckpt:
+        enc_sd = {k.replace("module.", "").replace("_orig_mod.", ""): v
+                  for k, v in ckpt["text_encoder"].items()}
+        text_conditioner.encoder.load_state_dict(enc_sd, strict=False)
+        print("  loaded fine-tuned RadBERT text encoder weights from checkpoint")
+
     model.to(device).eval()
     # RadBERT stays fp32; its output embeddings are cast in build_context_emb.
-    text_conditioner.to(device)
+    if text_conditioner is not None:
+        text_conditioner.to(device)
 
     # `--fp16` no longer half()s the model: it enables bf16 autocast inside
     # FlowMatcher (set up in main). The model stays fp32 here.
     if args.compile:
         model = torch.compile(model, backend="inductor")
 
-    return model, text_conditioner
+    return model, text_conditioner, out_channels
 
 
 def pad_to_multiple(volume: torch.Tensor, mult: int, min_z: int = 0):
@@ -572,7 +734,13 @@ def main():
     print(f"Using device: {device}")
 
     print(f"Loading checkpoint: {args.checkpoint_path}")
-    model, text_conditioner = load_model(args.checkpoint_path, device, args)
+    model, text_conditioner, out_channels = load_model(args.checkpoint_path, device, args)
+    if args.save_uncertainty_map and out_channels < 2:
+        raise ValueError(
+            "--save_uncertainty_map requires a UA-Flow 2-channel checkpoint "
+            f"(velocity mean + log-variance); {args.checkpoint_path} has "
+            f"out_channels={out_channels}. Train with train_flow_sigma.py."
+        )
     flow = FlowMatcher(model, sigma_min=args.sigma_min,
                        amp_enabled=args.fp16, amp_device=device.type)
 
@@ -606,14 +774,29 @@ def main():
         raw = img.get_fdata().astype(np.float32)
     print(f"  raw shape={raw.shape}, range=[{raw.min():.2f}, {raw.max():.2f}]")
 
-    prompt = resolve_prompt(args)
     # Keep embeddings fp32; bf16 autocast (when --fp16) casts them inside the UNet.
     ctx_dtype = torch.float32
-    print(f"  guidance_scale={args.guidance_scale}")
-
-    ctx_emb, null_emb = build_context_emb(
-        text_conditioner, prompt, device, ctx_dtype,
-    )
+    if text_conditioner is not None:
+        if args.prompt is None and args.prompt_json is None:
+            raise ValueError(
+                "This is a text-conditioned checkpoint; supply --prompt or "
+                "--prompt_json (the target description the model conditions on)."
+            )
+        prompt = resolve_prompt(args)
+        print(f"  guidance_scale={args.guidance_scale}")
+        ctx_emb, null_emb = build_context_emb(
+            text_conditioner, prompt, device, ctx_dtype,
+        )
+    else:
+        # Unconditioned checkpoint: no text pathway. CFG is meaningless, so force
+        # a single unconditional pass and ignore any supplied prompt.
+        if args.prompt is not None or args.prompt_json is not None:
+            print("  note: unconditioned checkpoint; ignoring the supplied prompt.")
+        if args.guidance_scale != 1.0:
+            print(f"  note: unconditioned checkpoint; forcing guidance_scale=1.0 "
+                  f"(was {args.guidance_scale}).")
+            args.guidance_scale = 1.0
+        ctx_emb, null_emb = None, None
 
     non_overlap = max(0, args.non_overlap)
     if non_overlap >= PATCH_Z:
@@ -621,7 +804,12 @@ def main():
             f"--non_overlap must be in [0, {PATCH_Z - 1}]; got {non_overlap}"
         )
 
-    normalized = raw / raw.max()
+    norm_div = args.norm_div if args.norm_div is not None else float(raw.max())
+    if norm_div <= 0:
+        raise ValueError(f"Normalization divisor must be > 0; got {norm_div}")
+    normalized = raw / norm_div
+    print(f"  norm_div={norm_div:.6f} "
+          f"({'fixed' if args.norm_div is not None else 'per-input max'})")
     vol_t = torch.from_numpy(normalized)
 
     if args.rk4:
@@ -651,6 +839,7 @@ def main():
             break
 
     plane_outputs = []
+    plane_uncs = []
     for plane in args.planes:
         plane_snapshot_path = None
         if snapshot_dir is not None:
@@ -658,19 +847,26 @@ def main():
                 snapshot_dir,
                 f"{output_basename}_{plane}_slab{args.snapshot_slab}.png",
             )
-        plane_out = run_plane_inference(
+        plane_out, plane_unc = run_plane_inference(
             vol_t, plane, ctx_emb, null_emb,
             sampler, args, device,
             snapshot_idx=snapshot_idx,
             snapshot_path=plane_snapshot_path,
         )
         plane_outputs.append(plane_out)
+        if plane_unc is not None:
+            plane_uncs.append(plane_unc)
 
     if len(plane_outputs) == 1:
         ensembled = plane_outputs[0]
     else:
         ensembled = torch.stack(plane_outputs, dim=0).mean(dim=0)
         print(f"Ensembled {len(plane_outputs)} planes by mean.")
+
+    ensembled_unc = None
+    if plane_uncs:
+        ensembled_unc = (plane_uncs[0] if len(plane_uncs) == 1
+                         else torch.stack(plane_uncs, dim=0).mean(dim=0))
 
     hist_ref = orig_img.get_fdata().astype(np.float32) if args.hist else None
 
@@ -681,10 +877,17 @@ def main():
             save_volume(plane_out, plane_path, to_orig_ornt, args.rescale,
                         orig_img, hist_match_ref=hist_ref,
                         repad_bounds=crop_bounds, pre_crop_shape=pre_crop_shape)
+        for plane, plane_unc in zip(args.planes, plane_uncs):
+            save_uncertainty(plane_unc, f"{output_base}_{plane}_uncertainty{output_ext}",
+                             to_orig_ornt, orig_img, crop_bounds, pre_crop_shape)
 
     save_volume(ensembled, args.output_path, to_orig_ornt, args.rescale,
                 orig_img, hist_match_ref=hist_ref,
                 repad_bounds=crop_bounds, pre_crop_shape=pre_crop_shape)
+
+    if ensembled_unc is not None:
+        save_uncertainty(ensembled_unc, f"{output_base}_uncertainty{output_ext}",
+                         to_orig_ornt, orig_img, crop_bounds, pre_crop_shape)
 
 
 if __name__ == "__main__":

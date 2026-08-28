@@ -7,9 +7,12 @@ inside a single acquisition:
   2. artifact  -> denoised + bias-corrected image
   3. raw       -> denoised + bias-corrected image
 
-The *target's* text prompt is used as the cross-attention context, so the
-prompt tells the model which output to produce ("Fully sampled ..." vs
-"Denoised and biascorrected ...").
+The prompt used as cross-attention context is composed here as
+"Input: <input description> <anatomy> MRI. Target: <target description>.",
+e.g. "Input: grappa undersampled brain MRI. Target: Fully sampled axial 3T
+brain T1-weighted BRAVO MRI of resolution 0.86 x 0.86 x 1.2 mm." The target
+half comes verbatim from the target's `<subject>.json` sidecar `prompt` key;
+the input half is derived from the artifact family (see `_input_phrase`).
 
 Layout assumed:
   <data_root>/<split>/<anatomy>/<acquisition>/<subject>/patch_<x>_<y>_<z>.nii.gz
@@ -26,8 +29,9 @@ where:
     the same patch coordinates but only a `patches_meta.json` (no prompt).
 
 Only the raw and denoised dirs carry a `<dir>.json` prompt sidecar; artifact
-dirs do not. Each prompt sidecar stores the ready-made text under the `prompt`
-key (no more on-the-fly param-to-text rendering).
+dirs do not. Each prompt sidecar stores the ready-made *target* text under
+the `prompt` key; the full "Input: ... Target: ..." prompt is assembled in
+`build_samples` (see `_input_phrase`).
 
 All patches are stored canonical `(192, 192, 16)` on disk, so loading is a
 plain center-crop to the requested `patch_shape` (default no crop). A smaller
@@ -73,6 +77,21 @@ def _artifact_family(suffix: str) -> str:
     if suffix.startswith("_ANISO_"):
         return "aniso"
     return "unknown"
+
+
+_ARTIFACT_INPUT_PHRASE = {
+    "spike": "spiking artifact",
+    "undersampled": "grappa undersampled",
+    "aniso": "unisotropic undersampled",
+}
+
+
+def _input_phrase(family: str) -> str:
+    """Phrase for the "Input: ..." half of a sample's prompt, from its
+    `_artifact_family` result. The three ANISO k-space-direction variants
+    (phase/read/par) all collapse to the same "unisotropic undersampled"
+    phrase."""
+    return _ARTIFACT_INPUT_PHRASE.get(family, "artifact")
 
 
 _DENOISED_PREFIX = "md"
@@ -182,10 +201,12 @@ class PatchPairDataset(Dataset):
     """One sample = (condition, target, prompt, target_type, anatomy, artifact).
 
     Each volume tensor is shape (1, *patch_shape) (default (1, 192, 192, 16)).
-    `prompt` is the target's ready-made text description (see the sidecar
-    `prompt` key), e.g. "Fully sampled coronal 1.5T knee Proton Density MRI ..."
-    or "Denoised and biascorrected ...". Tokenization happens in the training
-    script, keeping this module free of any text-encoder dependency.
+    `prompt` is the composed "Input: ... Target: ..." text description (see
+    `build_samples` / `_input_phrase`), e.g. "Input: grappa undersampled knee
+    MRI. Target: Fully sampled coronal 1.5T knee Proton Density MRI ..." or
+    "Input: fully sampled knee MRI. Target: Denoised and biascorrected ...".
+    Tokenization happens in the training script, keeping this module free of
+    any text-encoder dependency.
 
     `patch_shape` center-crops both the condition and target after they are
     loaded. Both members of a pair share the same patch coordinate so their
@@ -290,13 +311,15 @@ def build_samples(data_root: str, split: str, anatomy: str):
             # Tasks 1 & 2: artifact -> raw, artifact -> denoised.
             for art in _find_artifact_siblings(subjects, name):
                 art_family = _artifact_family(art[len(name):])
+                input_phrase = _input_phrase(art_family)
                 art_patches = _index_subject_patches(os.path.join(acq_dir, art))
                 for coord, art_path in art_patches.items():
                     if coord in raw_patches:
                         samples.append({
                             "condition_path": art_path,
                             "target_path": raw_patches[coord],
-                            "prompt": raw_prompt,
+                            "prompt": f"Input: {input_phrase} {anatomy} MRI. "
+                                      f"Target: {raw_prompt}",
                             "task": "artifact2raw",
                             "anatomy": anatomy,
                             "artifact": art_family,
@@ -305,7 +328,8 @@ def build_samples(data_root: str, split: str, anatomy: str):
                         samples.append({
                             "condition_path": art_path,
                             "target_path": den_patches[coord],
-                            "prompt": den_prompt,
+                            "prompt": f"Input: {input_phrase} {anatomy} MRI. "
+                                      f"Target: {den_prompt}",
                             "task": "artifact2denoised",
                             "anatomy": anatomy,
                             "artifact": art_family,
@@ -318,7 +342,8 @@ def build_samples(data_root: str, split: str, anatomy: str):
                         samples.append({
                             "condition_path": raw_path,
                             "target_path": den_patches[coord],
-                            "prompt": den_prompt,
+                            "prompt": f"Input: fully sampled {anatomy} MRI. "
+                                      f"Target: {den_prompt}",
                             "task": "raw2denoised",
                             "anatomy": anatomy,
                             "artifact": "clean",
@@ -458,7 +483,7 @@ class BalancedDistributedSampler(Sampler):
         self.contrast_indices = {k: list(v) for k, v in contrast_indices.items() if v}
         # `samples_per_contrast` may be a scalar (same quota for every group) or
         # a dict {group_key: quota} for per-group quotas, e.g. an up-weighted
-        # aniso group (see `_artifact_fraction_quota`). A scalar <= 0 / None
+        # aniso group (see `_build_group_quota`). A scalar <= 0 / None
         # auto-balances to the smallest group.
         if isinstance(samples_per_contrast, dict):
             self.quota = {k: int(samples_per_contrast[k])
@@ -513,41 +538,174 @@ class BalancedDistributedSampler(Sampler):
         self.epoch = epoch
 
 
-def _artifact_fraction_quota(group_indices, family, frac, base):
-    """Per-group sample quotas that make `family` a fixed fraction per anatomy.
+def parse_anatomy_weight(tokens):
+    """Parse ['brain=0.1', 'knee=0.45', ...] -> {anatomy: float}.
 
-    `group_indices` maps `(anatomy, artifact)` -> dataset indices. For each
-    anatomy that has the target `family` group alongside >=1 other group, the
-    target group's quota is raised so the family makes up `frac` of that
-    anatomy's epoch samples while every other group keeps `base`:
-
-        target = base * n_other * frac / (1 - frac)
-
-    so e.g. base=2000, family with 3 other groups, frac=0.7 -> target=14000
-    (14000 / 20000 = 0.7). Anatomies without the family (or with only the
-    family) keep `base` for all their groups. Returns
-    `{(anatomy, artifact): quota}`.
+    Each token is `anatomy=fraction`. Each fraction must be in (0, 1] and the
+    set must sum to 1.0 (within 1e-6) -- they are target epoch fractions, not
+    relative weights. Returns the dict, or None if `tokens` is empty/None.
     """
+    if not tokens:
+        return None
+    weights = {}
+    for tok in tokens:
+        if "=" not in tok:
+            raise ValueError(
+                f"--anatomy_weight expects anatomy=fraction tokens, got {tok!r}"
+            )
+        anatomy, frac = tok.split("=", 1)
+        anatomy = anatomy.strip()
+        try:
+            frac = float(frac)
+        except ValueError:
+            raise ValueError(f"anatomy_weight fraction is not a number: {tok!r}")
+        if not (0.0 < frac <= 1.0):
+            raise ValueError(
+                f"anatomy_weight fraction must be in (0, 1], got {frac} for {anatomy!r}"
+            )
+        if anatomy in weights:
+            raise ValueError(f"anatomy_weight has duplicate anatomy {anatomy!r}")
+        weights[anatomy] = frac
+    total = sum(weights.values())
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(
+            f"anatomy_weight fractions must sum to 1.0, got {total} ({weights})"
+        )
+    return weights
+
+
+def _check_frac(frac, tok):
     if not (0.0 < frac < 1.0):
-        raise ValueError(f"artifact_fraction's fraction must be in (0, 1), got {frac}")
+        raise ValueError(
+            f"artifact fraction must be in (0, 1), got {frac} in {tok!r}")
+    return frac
+
+
+def parse_artifact_fraction(tokens):
+    """Parse --artifact_fraction tokens into `(family, frac)`.
+
+    `tokens[0]` is the family. Remaining tokens are a bare float (the shared
+    default fraction, at most one) and/or `anatomy=fraction` overrides:
+
+        ['aniso', '0.7']                   -> ('aniso', 0.7)            # scalar
+        ['aniso', '0.7', 'brain=0.1']      -> ('aniso', {'default':0.7,'brain':0.1})
+        ['aniso', 'brain=0.1', 'knee=0.4'] -> ('aniso', {'brain':0.1,'knee':0.4})
+
+    Returns None if `tokens` is empty/None. Anatomies are brain/knee/prostate,
+    so the literal key 'default' never collides with a real anatomy.
+    """
+    if not tokens:
+        return None
+    family = tokens[0]
+    shared = None
+    per_anatomy = {}
+    for tok in tokens[1:]:
+        if "=" in tok:
+            anatomy, frac = tok.split("=", 1)
+            per_anatomy[anatomy.strip()] = _check_frac(float(frac), tok)
+        else:
+            if shared is not None:
+                raise ValueError(
+                    f"--artifact_fraction got two shared fractions; expected one: {tokens}"
+                )
+            shared = _check_frac(float(tok), tok)
+    if not per_anatomy:
+        if shared is None:
+            raise ValueError(
+                f"--artifact_fraction needs a fraction after the family: {tokens}")
+        return (family, shared)
+    frac = dict(per_anatomy)
+    if shared is not None:
+        frac["default"] = shared
+    return (family, frac)
+
+
+def _resolve_artifact_frac(artifact_fraction, anatomy):
+    """Return `(family, g)` for an anatomy, where `g` is its resolved fraction
+    or None (no up-weighting for this anatomy)."""
+    if artifact_fraction is None:
+        return None, None
+    family, frac = artifact_fraction
+    if isinstance(frac, dict):
+        g = frac.get(anatomy, frac.get("default"))
+    else:
+        g = frac
+    return family, g
+
+
+def _build_group_quota(group_indices, base, artifact_fraction=None,
+                       anatomy_weight=None):
+    """Per-group sample quotas for `BalancedDistributedSampler`.
+
+    `group_indices` maps a group key -> dataset indices. Keys are either
+    `(anatomy, artifact)` tuples (balance_by='anatomy_artifact') or plain
+    anatomy strings (balance_by='anatomy'). Returns `{group_key: int}`.
+
+    Two regimes (see docs/superpowers/specs/2026-06-30-anatomy-artifact-weighting-design.md):
+
+    * `anatomy_weight is None` (legacy): every "other" group keeps `base`; when
+      an `artifact_fraction` resolves for an anatomy that has the family group
+      plus >=1 other group, the family group is enlarged to
+      `base * n_other * g / (1 - g)`.
+    * `anatomy_weight` set: epoch size is fixed at `T = base * N` (N = number of
+      groups). Anatomy `a` gets budget `T * f_a`, split uniformly across its
+      groups or skewed so the family group is `g` of the budget.
+    """
     if base is None or base <= 0:
         raise ValueError(
-            "artifact_fraction requires a positive --samples_per_contrast (the "
-            "base quota the up-weighting is computed from)"
+            "anatomy/artifact weighting requires a positive --samples_per_contrast"
         )
+
+    def anatomy_of(key):
+        return key[0] if isinstance(key, tuple) else key
+
+    def is_family(key, family):
+        return isinstance(key, tuple) and key[1] == family
+
     by_anatomy = {}
-    for (anatomy, artifact) in group_indices:
-        by_anatomy.setdefault(anatomy, []).append(artifact)
+    for key in group_indices:
+        by_anatomy.setdefault(anatomy_of(key), []).append(key)
+
+    if anatomy_weight is not None:
+        missing = [a for a in by_anatomy if a not in anatomy_weight]
+        if missing:
+            raise ValueError(
+                f"--anatomy_weight must cover every trained anatomy; missing "
+                f"{sorted(missing)} (have {sorted(anatomy_weight)})"
+            )
+        T = base * len(group_indices)
 
     quota = {}
-    for anatomy, arts in by_anatomy.items():
-        others = [a for a in arts if a != family]
-        has_family = family in arts
-        for a in arts:
-            if a == family and has_family and others:
-                quota[(anatomy, a)] = int(round(base * len(others) * frac / (1.0 - frac)))
+    for anatomy, keys in by_anatomy.items():
+        family, g = _resolve_artifact_frac(artifact_fraction, anatomy)
+        fam_keys = [k for k in keys if is_family(k, family)] if family else []
+        other_keys = [k for k in keys if k not in fam_keys]
+        upweight = bool(fam_keys) and bool(other_keys) and g is not None
+
+        if anatomy_weight is None:
+            for k in keys:
+                if upweight and k in fam_keys:
+                    quota[k] = int(round(base * len(other_keys) * g / (1.0 - g)))
+                else:
+                    quota[k] = int(base)
+        else:
+            budget = T * anatomy_weight[anatomy]
+            if upweight:
+                fam_q = int(round(budget * g))
+                other_q = int(round(budget * (1.0 - g) / len(other_keys)))
+                for k in keys:
+                    quota[k] = fam_q if k in fam_keys else other_q
             else:
-                quota[(anatomy, a)] = int(base)
+                each = int(round(budget / len(keys)))
+                for k in keys:
+                    quota[k] = each
+
+    nonpos = [k for k, v in quota.items() if v <= 0]
+    if nonpos:
+        raise ValueError(
+            f"computed non-positive sample quota for groups {nonpos}; raise "
+            f"--samples_per_contrast or adjust the weights/fractions"
+        )
     return quota
 
 
@@ -568,6 +726,7 @@ def getloader_3d_patches(
     augment_kwargs=None,
     artifacts=None,
     artifact_fraction=None,
+    anatomy_weight=None,
 ):
     """DataLoaders for 3D NIfTI patch restoration. DDP-aware.
 
@@ -606,8 +765,15 @@ def getloader_3d_patches(
     fraction of each anatomy's per-epoch samples. Pass `(family, frac)`, e.g.
     `("aniso", 0.7)`: every other group keeps `samples_per_contrast`, and the
     family's group is enlarged so it makes up `frac` of that anatomy's samples
-    (see `_artifact_fraction_quota`). Requires `balance_by="anatomy_artifact"`
+    (see `_build_group_quota`). Requires `balance_by="anatomy_artifact"`
     and a positive `samples_per_contrast`. `None` (default) keeps equal groups.
+
+    `anatomy_weight` optionally re-divides the epoch into fixed per-anatomy
+    target fractions, e.g. `{"brain": 0.1, "knee": 0.45, "prostate": 0.45}`.
+    The epoch size is held at `samples_per_contrast * <#groups>` and split so
+    each anatomy gets its fraction (artifacts uniform within, unless
+    `artifact_fraction` also skews them). `None` (default) = equal groups.
+    Must cover every trained anatomy and sum to 1.0 (see `_build_group_quota`).
     """
     if balance_by not in ("anatomy", "anatomy_artifact"):
         raise ValueError(
@@ -627,18 +793,19 @@ def getloader_3d_patches(
         balance_indices = (train_set.group_indices
                            if balance_by == "anatomy_artifact"
                            else train_set.contrast_indices)
-        # Up-weight one artifact family to a fixed per-anatomy fraction by
-        # handing the sampler per-group quotas instead of one scalar.
         spc = samples_per_contrast
-        if artifact_fraction is not None:
-            if balance_by != "anatomy_artifact":
+        if artifact_fraction is not None or anatomy_weight is not None:
+            if artifact_fraction is not None and balance_by != "anatomy_artifact":
                 raise ValueError(
                     "artifact_fraction requires balance_by='anatomy_artifact'"
                 )
-            family, frac = artifact_fraction
-            spc = _artifact_fraction_quota(
-                train_set.group_indices, family, float(frac), samples_per_contrast
+            spc = _build_group_quota(
+                balance_indices, samples_per_contrast,
+                artifact_fraction=artifact_fraction,
+                anatomy_weight=anatomy_weight,
             )
+            if (rank if distributed else 0) == 0:
+                print(f"[quota] resolved per-group sample quotas: {spc}")
         train_sampler = BalancedDistributedSampler(
             balance_indices,
             samples_per_contrast=spc,
