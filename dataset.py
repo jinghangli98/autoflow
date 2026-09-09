@@ -1,46 +1,72 @@
-"""3D NIfTI patch dataset for flow matching (multi-task restoration).
+"""Whole-volume NIfTI dataset for flow matching (multi-task restoration).
 
-Builds (condition, target, prompt) patch pairs for three restoration tasks
-inside a single acquisition:
+Builds (condition, target, prompt) volume pairs for three restoration tasks
+inside a single acquisition, and serves random thin 3D patches from them:
 
   1. artifact  -> raw (fully sampled, unprocessed) image
   2. artifact  -> denoised + bias-corrected image
   3. raw       -> denoised + bias-corrected image
 
+Layout assumed (no JSON sidecars, no train/test folders):
+  <data_root>/<anatomy>/<acquisition>/<subject>/<file>.nii.gz
+where:
+  * <anatomy>      is one of {brain, knee, prostate}.
+  * <acquisition>  is `<sequence>_<orientation>_<field>`, e.g. `bravo_ax_3T`,
+                   `tse_cor_7T`, `pdfs_cor_1.5T`.
+  * <subject>      is a subject/session dir. 3T `PRT<id>_<yyyy.mm.dd>` dirs are
+                   sessions of patient `PRT<id>` (see `patient_key`).
+  * files inside a subject dir are told apart by name (see `classify_file`):
+      - `<stem>.nii.gz`                       raw, fully sampled
+      - `d<stem>.nii.gz`                      denoised only (indexed, unused)
+      - `md<stem>.nii.gz`                     denoised + bias-corrected
+      - `<stem>_R<n>`, `<stem>_SPIKE_R<n>`,
+        `<stem>_ANISO_{phase,read,par}<n>`    grappa / spike / aniso artifacts
+                                              at various severities
+      - `r<stem'>_lowres.nii.gz`              real low-resolution acquisition
+                                              (bravo/flair 3T); treated as the
+                                              `aniso` family
+    Not every subject has every artifact or every severity.
+
 The prompt used as cross-attention context is composed here as
 "Input: <input description> <anatomy> MRI. Target: <target description>.",
 e.g. "Input: grappa undersampled brain MRI. Target: Fully sampled axial 3T
 brain T1-weighted BRAVO MRI of resolution 0.86 x 0.86 x 1.2 mm." The target
-half comes verbatim from the target's `<subject>.json` sidecar `prompt` key;
-the input half is derived from the artifact family (see `_input_phrase`).
+half comes from the acquisition folder name (sequence, field strength), the
+NIfTI voxel size, and the *plane of the extracted patch* -- the orientation
+word is decided per patch by its thin axis (sagittal / coronal / axial, via
+the NIfTI affine; the folder's `_ax_`/`_cor_` token is not used). Samples
+therefore carry a prompt *template* with a `{plane}` slot that
+`VolumePairDataset` fills per patch; the input half comes from the artifact
+family (`_input_phrase`).
 
-Layout assumed:
-  <data_root>/<split>/<anatomy>/<acquisition>/<subject>/patch_<x>_<y>_<z>.nii.gz
-where:
-  * <anatomy>      is one of {brain, knee, prostate}.
-  * <acquisition>  is a sequence/orientation/field folder, e.g. `mprage_ax_3T`,
-                   `pd_cor_1.5T`, `tse_ax_3T`.
-  * <subject>      is the *raw* (fully sampled, unprocessed) id, e.g. `2033AM`.
-                   Its prompt sidecar `<subject>.json` has `processing: raw`.
-  * `md<subject>`  is the denoised + bias-corrected counterpart; its sidecar
-                   `md<subject>.json` has `processing: denoised+biascorrected`.
-  * `<subject>_R<n>`, `<subject>_SPIKE_R<n>`,
-    `<subject>_ANISO_{phase,read,par}<n>` are the artifact siblings. They carry
-    the same patch coordinates but only a `patches_meta.json` (no prompt).
+Volumes on disk are *not* intensity-normalized and their scales differ wildly
+even within one subject (raw 0-255 or 0-25000, `d*` 0-25000, `md*` 0-255).
+Each volume is therefore normalized independently when loaded
+(`normalize_volume`): robust percentiles (default 0.5 / 99.5) of that whole
+volume map to [0, 1]. Patches are then cropped from the normalized volume,
+so a thin patch keeps whatever sub-range of [0, 1] it happens to cover -- it
+is *not* re-stretched to span 0..1.
 
-Only the raw and denoised dirs carry a `<dir>.json` prompt sidecar; artifact
-dirs do not. Each prompt sidecar stores the ready-made *target* text under
-the `prompt` key; the full "Input: ... Target: ..." prompt is assembled in
-`build_samples` (see `_input_phrase`).
+`VolumePairDataset.__getitem__` loads one pair, normalizes both volumes, and
+draws `patches_per_volume` random crops of `patch_shape` (default
+(96, 96, 7)) at shared coordinates. The thin (7-voxel) axis of each crop is
+drawn at random from the sample's `thin_axes`: all three array axes for 3D
+acquisitions (axial / sagittal / coronal thin slabs), only the through-plane
+axis (largest voxel size) for 2D multi-slice sequences listed in
+`SINGLE_PLANE_SEQUENCES` (TSE). Axes along which a 96x96 in-plane crop does
+not fit (e.g. 36-slice TSE, 30-slice knee/prostate) are skipped. The thin
+axis is moved last, so every patch is `(96, 96, 7)` regardless of plane.
+`collate_patches` flattens those so a DataLoader with `batch_size=B` yields
+`B * patches_per_volume` patches per step in the usual `(B', 1, X, Y, Z)`
+layout.
 
-All patches are stored canonical `(192, 192, 16)` on disk, so loading is a
-plain center-crop to the requested `patch_shape` (default no crop). A smaller
-`patch_shape` such as `(96, 96, 16)` yields a genuine sub-volume at the same
-resolution -- useful for quick model debugging.
+Train/val: a deterministic patient-level split *within* `data_root`
+(`val_fraction`). The held-out test subjects live in a separate root (see
+`make_test_split.py`) and are never read here unless that root is passed
+explicitly.
 """
 
-import glob
-import json
+import hashlib
 import math
 import os
 import random
@@ -55,19 +81,21 @@ from torch.utils.data.distributed import DistributedSampler
 import torchio as tio
 
 
-_PATCH_RE = re.compile(r"patch_(\d+)_(\d+)_(\d+)\.nii\.gz$")
-# Artifact dir suffix appended to a raw subject id, e.g. `_R3`, `_SPIKE_R4`,
-# `_ANISO_phase3.5`, `_ANISO_read4`, `_ANISO_par3`.
+_NII = ".nii.gz"
+
+# Artifact suffix appended to a raw stem, e.g. `_R3`, `_SPIKE_R4`,
+# `_SPIKE_R4.5`, `_ANISO_phase3.5`, `_ANISO_read4`, `_ANISO_par3`.
 _ARTIFACT_SUFFIX_RE = re.compile(
-    r"_(?:R\d+|SPIKE_R\d+|ANISO_(?:phase|read|par)\d+(?:\.\d+)?)$"
+    r"_(R\d+|SPIKE_R\d+(?:\.\d+)?|ANISO_(?:phase|read|par)\d+(?:\.\d+)?)$"
 )
+_LOWRES_RE = re.compile(r"^r(.+)_lowres$")
+_SESSION_RE = re.compile(r"^(PRT\d+)_\d{4}\.\d{2}\.\d{2}$")
 
 
 def _artifact_family(suffix: str) -> str:
-    """Coarse artifact family for a sample, from the artifact dir suffix.
+    """Coarse artifact family from an artifact suffix (with leading `_`).
 
-    `suffix` is the part of an artifact sibling dir name after the raw
-    subject name, e.g. `_R8`, `_SPIKE_R4`, `_ANISO_phase3.5`. The order of
+    `suffix` is e.g. `_R8`, `_SPIKE_R4`, `_ANISO_phase3.5`. The order of
     checks matters: `_SPIKE_R*` also contains `R*`, so it is tested first.
     """
     if suffix.startswith("_SPIKE_R"):
@@ -82,70 +110,369 @@ def _artifact_family(suffix: str) -> str:
 _ARTIFACT_INPUT_PHRASE = {
     "spike": "spiking artifact",
     "undersampled": "grappa undersampled",
-    "aniso": "unisotropic undersampled",
+    "aniso": "anisotropic undersampled",
 }
 
 
 def _input_phrase(family: str) -> str:
     """Phrase for the "Input: ..." half of a sample's prompt, from its
-    `_artifact_family` result. The three ANISO k-space-direction variants
-    (phase/read/par) all collapse to the same "unisotropic undersampled"
-    phrase."""
+    artifact family. The three ANISO k-space-direction variants (phase/read/
+    par) and the real low-res acquisitions all collapse to the same
+    "anisotropic undersampled" phrase."""
     return _ARTIFACT_INPUT_PHRASE.get(family, "artifact")
 
 
-_DENOISED_PREFIX = "md"
+# --------------------------------------------------------------------------
+# File-name classification
+# --------------------------------------------------------------------------
 
+def classify_file(name: str, stems=None):
+    """Classify one file name inside a subject dir.
 
-def _index_subject_patches(subject_dir: str):
-    """Map (x, y, z) tuple -> absolute patch path for a subject directory."""
-    out = {}
-    for f in glob.glob(os.path.join(subject_dir, "patch_*.nii.gz")):
-        m = _PATCH_RE.search(os.path.basename(f))
-        if not m:
-            continue
-        x, y, z = (int(m.group(i)) for i in (1, 2, 3))
-        out[(x, y, z)] = f
-    return out
+    Returns None for non-NIfTI names, else a dict:
+      role      -- "raw" | "denoised" (`d*`) | "md" (`md*`) | "artifact"
+      stem      -- the raw stem this file belongs to
+      artifact  -- family for role "artifact" (undersampled/spike/aniso), else None
+      severity  -- e.g. "R3", "SPIKE_R4", "ANISO_par3.5", "lowres"; else None
 
-
-def _center_crop(arr: np.ndarray, shape) -> np.ndarray:
-    """Center-crop a 3D array to `shape`.
-
-    No-op along any axis where the target size is >= the current size, so
-    `shape=(192, 192, 16)` on an already-(192, 192, 16) array returns it
-    unchanged.
+    `stems` (optional) is the set of all stems in the same dir. When given,
+    the `d`/`md` prefix rules only fire if the prefix-stripped stem exists,
+    so a raw stem that happens to start with "d" is not misread.
     """
-    slices = []
-    for cur, tgt in zip(arr.shape, shape):
-        if tgt >= cur:
-            slices.append(slice(None))
+    if not name.endswith(_NII):
+        return None
+    stem = name[: -len(_NII)]
+
+    def _info(role, base, artifact=None, severity=None):
+        return {"role": role, "stem": base, "artifact": artifact,
+                "severity": severity}
+
+    m = _ARTIFACT_SUFFIX_RE.search(stem)
+    if m:
+        sev = m.group(1)
+        return _info("artifact", stem[: m.start()], _artifact_family("_" + sev), sev)
+    m = _LOWRES_RE.match(stem)
+    if m:
+        base = m.group(1) + "_highres"
+        if stems is None or base in stems:
+            return _info("artifact", base, "aniso", "lowres")
+    if stem.startswith("md") and (stems is None or stem[2:] in stems):
+        return _info("md", stem[2:])
+    if stem.startswith("d") and (stems is None or stem[1:] in stems):
+        return _info("denoised", stem[1:])
+    return _info("raw", stem)
+
+
+def patient_key(subject_dir: str) -> str:
+    """Collapse `PRT<id>_<yyyy.mm.dd>` sessions to `PRT<id>`; else identity."""
+    m = _SESSION_RE.match(subject_dir)
+    return m.group(1) if m else subject_dir
+
+
+# --------------------------------------------------------------------------
+# Prompt construction
+# --------------------------------------------------------------------------
+
+# `<sequence>` token of an acquisition folder -> descriptive phrase.
+SEQUENCE_DESC = {
+    "bravo": "T1-weighted BRAVO",
+    "mprage": "T1-weighted MPRAGE",
+    "mp2rage": "T1-weighted MP2RAGE",
+    "flair": "T2-weighted FLAIR",
+    "space": "T2-weighted SPACE",
+    "tse": "T2-weighted TSE",
+    "pd": "Proton Density",
+    "pdfs": "fat-suppressed Proton Density",
+    "tof": "Time-of-Flight angiography",
+}
+# Anatomical plane of a slab whose thin axis runs along a given axis code.
+_PLANE_OF_AXCODE = {"R": "sagittal", "L": "sagittal", "A": "coronal",
+                    "P": "coronal", "S": "axial", "I": "axial"}
+# Fallback when no affine is known: assumes RAS-like storage (x, y, z).
+DEFAULT_AXIS_PLANES = ["sagittal", "coronal", "axial"]
+TARGET_DESC = {"raw": "Fully sampled", "md": "Denoised and biascorrected"}
+
+# 2D multi-slice sequences: thin patches only along the through-plane axis.
+SINGLE_PLANE_SEQUENCES = ("tse",)
+
+
+def parse_acquisition(acq: str):
+    """`bravo_ax_3T` -> ("bravo", "ax", "3T")."""
+    parts = acq.split("_")
+    if len(parts) != 3:
+        raise ValueError(
+            f"acquisition folder must be <sequence>_<orientation>_<field>, got {acq!r}")
+    return tuple(parts)
+
+
+def _fmt_mm(z: float) -> str:
+    s = f"{float(z):.2f}".rstrip("0")
+    return s + "0" if s.endswith(".") else s
+
+
+def axis_planes(affine) -> list:
+    """Plane name for a slab thin along each array axis, from the affine:
+    RAS storage -> ["sagittal", "coronal", "axial"]."""
+    return [_PLANE_OF_AXCODE[c] for c in nib.aff2axcodes(np.asarray(affine))]
+
+
+def build_target_prompt(kind: str, anatomy: str, acq: str, zooms,
+                        plane: str = "{plane}") -> str:
+    """Target half of the prompt, e.g.
+    "Fully sampled axial 3T brain T1-weighted BRAVO MRI of resolution
+    0.86 x 0.86 x 1.2 mm."  `kind` is "raw" or "md". `plane` is the slab
+    orientation word; the default leaves a `{plane}` slot to be filled per
+    patch with `str.format`. The folder's orientation token is ignored."""
+    seq, _orient, field = parse_acquisition(acq)
+    res = " x ".join(_fmt_mm(z) for z in zooms[:3])
+    return (f"{TARGET_DESC[kind]} {plane} {field} {anatomy} "
+            f"{SEQUENCE_DESC.get(seq, seq.upper())} MRI of resolution {res} mm.")
+
+
+# --------------------------------------------------------------------------
+# Pair enumeration + patient split
+# --------------------------------------------------------------------------
+
+def _val_patients(patients, val_fraction: float, seed: int):
+    """Deterministic patient-level val subset: rank patients by a seeded hash
+    and take the first ceil(frac * n), leaving at least one for train."""
+    patients = sorted(set(patients))
+    if val_fraction <= 0 or len(patients) < 2:
+        return set()
+    n_val = min(math.ceil(val_fraction * len(patients)), len(patients) - 1)
+
+    def h(p):
+        return hashlib.md5(f"{seed}:{p}".encode()).hexdigest()
+
+    return set(sorted(patients, key=h)[:n_val])
+
+
+def _read_header(path):
+    """(zooms, axis_planes) of a NIfTI without loading its data."""
+    img = nib.load(path)
+    return (tuple(float(z) for z in img.header.get_zooms()[:3]),
+            axis_planes(img.affine))
+
+
+def _drop_shape_mismatches(samples):
+    """Remove pairs whose condition/target voxel shapes differ (header check).
+
+    Cheap (one header read per distinct file) and done once at index time so
+    a bad file cannot crash a DataLoader worker mid-epoch. Prints one line per
+    dropped pair.
+    """
+    shapes = {}
+
+    def shape_of(path):
+        if path not in shapes:
+            shapes[path] = tuple(int(n) for n in nib.load(path).shape[:3])
+        return shapes[path]
+
+    kept, dropped = [], {}
+    for s in samples:
+        a, b = shape_of(s["condition_path"]), shape_of(s["target_path"])
+        if a == b:
+            kept.append(s)
         else:
-            start = (cur - tgt) // 2
-            slices.append(slice(start, start + tgt))
-    return arr[tuple(slices)]
+            key = (os.path.dirname(s["condition_path"]), a, b)
+            dropped.setdefault(key, set()).add(os.path.basename(s["condition_path"]))
+    for (subject_dir, a, b), files in sorted(dropped.items()):
+        print(f"warning: {subject_dir}: skipping {len(files)} condition file(s) "
+              f"of shape {a} whose target is {b}: {', '.join(sorted(files))}")
+    return kept
 
 
-def _load_patch(path: str, patch_shape=(192, 192, 16)) -> torch.Tensor:
-    """Load a canonical (192, 192, 16) NIfTI patch as float32 (1, *patch_shape)."""
-    arr = nib.load(path).get_fdata().astype(np.float32)
-    arr = _center_crop(arr, patch_shape)
-    return torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
+def build_samples(data_root: str, anatomy: str, split: str = "train",
+                  val_fraction: float = 0.10, split_seed: int = 42):
+    """Enumerate (condition, target, prompt) *volume* pairs for one anatomy.
 
+    `split` is "train", "val" or "all". Train/val is a patient-level split
+    (`patient_key`) of everything under `<data_root>/<anatomy>/`.
 
-def _read_prompt(subject_dir: str, subject_name: str):
-    """Read (prompt, processing) from a subject's `<subject>.json` sidecar.
+    Pairs whose condition and target differ in voxel shape (header check) are
+    skipped with a printed warning (see `_drop_shape_mismatches`).
 
-    The newer datasets store the ready-made text prompt directly under the
-    `prompt` key; `processing` is one of {"raw", "denoised+biascorrected"}.
+    Returns a list of dicts with keys: condition_path, target_path, prompt
+    (template with a `{plane}` slot), task (artifact2raw | artifact2denoised |
+    raw2denoised), target_type (raw | denoised), anatomy, artifact
+    (undersampled | spike | aniso | clean), severity, acquisition, subject,
+    patient, thin_axes (array axes the thin patch dimension may lie along; see
+    `SINGLE_PLANE_SEQUENCES`), axis_planes (plane word per array axis).
     """
-    with open(os.path.join(subject_dir, f"{subject_name}.json")) as f:
-        meta = json.load(f)
-    return meta["prompt"], meta.get("processing", "")
+    if split not in ("train", "val", "all"):
+        raise ValueError(f"split must be train/val/all, got {split!r}")
+    anatomy_dir = os.path.join(data_root, anatomy)
+    if not os.path.isdir(anatomy_dir):
+        raise FileNotFoundError(f"Anatomy directory not found: {anatomy_dir}")
+
+    samples = []
+    for acq in sorted(os.listdir(anatomy_dir)):
+        acq_dir = os.path.join(anatomy_dir, acq)
+        if not os.path.isdir(acq_dir):
+            continue
+        for subject in sorted(os.listdir(acq_dir)):
+            sub_dir = os.path.join(acq_dir, subject)
+            if not os.path.isdir(sub_dir):
+                continue
+            names = sorted(n for n in os.listdir(sub_dir) if n.endswith(_NII))
+            stems = {n[: -len(_NII)] for n in names}
+            raws, mds, arts = {}, {}, []
+            for n in names:
+                info = classify_file(n, stems)
+                path = os.path.join(sub_dir, n)
+                if info["role"] == "raw":
+                    raws[info["stem"]] = path
+                elif info["role"] == "md":
+                    mds[info["stem"]] = path
+                elif info["role"] == "artifact":
+                    arts.append((info, path))
+
+            patient = patient_key(subject)
+            for stem, raw_path in raws.items():
+                zooms, planes = _read_header(raw_path)
+                raw_prompt = build_target_prompt("raw", anatomy, acq, zooms)
+                md_path = mds.get(stem)
+                md_prompt = (build_target_prompt("md", anatomy, acq, zooms)
+                             if md_path else None)
+                if parse_acquisition(acq)[0] in SINGLE_PLANE_SEQUENCES:
+                    thin_axes = [int(np.argmax(zooms))]
+                else:
+                    thin_axes = [0, 1, 2]
+                meta = {"anatomy": anatomy, "acquisition": acq,
+                        "subject": subject, "patient": patient,
+                        "thin_axes": thin_axes, "axis_planes": planes}
+
+                for info, art_path in arts:
+                    if info["stem"] != stem:
+                        continue
+                    phrase = _input_phrase(info["artifact"])
+                    samples.append({
+                        "condition_path": art_path, "target_path": raw_path,
+                        "prompt": f"Input: {phrase} {anatomy} MRI. Target: {raw_prompt}",
+                        "task": "artifact2raw", "target_type": "raw",
+                        "artifact": info["artifact"], "severity": info["severity"],
+                        **meta,
+                    })
+                    if md_path:
+                        samples.append({
+                            "condition_path": art_path, "target_path": md_path,
+                            "prompt": f"Input: {phrase} {anatomy} MRI. Target: {md_prompt}",
+                            "task": "artifact2denoised", "target_type": "denoised",
+                            "artifact": info["artifact"], "severity": info["severity"],
+                            **meta,
+                        })
+                if md_path:
+                    samples.append({
+                        "condition_path": raw_path, "target_path": md_path,
+                        "prompt": f"Input: fully sampled {anatomy} MRI. Target: {md_prompt}",
+                        "task": "raw2denoised", "target_type": "denoised",
+                        "artifact": "clean", "severity": None,
+                        **meta,
+                    })
+
+    samples = _drop_shape_mismatches(samples)
+    if split == "all":
+        return samples
+    val = _val_patients((s["patient"] for s in samples), val_fraction, split_seed)
+    want_val = split == "val"
+    return [s for s in samples if (s["patient"] in val) == want_val]
 
 
-def _has_prompt(subject_dir: str, subject_name: str) -> bool:
-    return os.path.exists(os.path.join(subject_dir, f"{subject_name}.json"))
+def prompt_for_path(path: str, target: str = "raw"):
+    """The loader's prompt (and plane metadata) for one input file, for
+    inference. `path` must sit in the training layout
+    `<root>/<anatomy>/<acq>/<subject>/<file>.nii.gz`; the file's role and
+    artifact family come from its name and its siblings, the resolution and
+    plane order from its header. `target` is "raw" (fully sampled) or "md"
+    (denoised + bias-corrected).
+
+    Returns a dict: prompt (template with a `{plane}` slot), anatomy,
+    acquisition, subject, artifact (undersampled | spike | aniso | clean),
+    severity, thin_axes, axis_planes -- the same fields `build_samples` gives
+    a training pair.
+    """
+    if target not in TARGET_DESC:
+        raise ValueError(f"target must be one of {tuple(TARGET_DESC)}, got {target!r}")
+    path = os.path.abspath(path)
+    sub_dir, name = os.path.split(path)
+    acq_dir, subject = os.path.split(sub_dir)
+    anatomy_dir, acq = os.path.split(acq_dir)
+    anatomy = os.path.basename(anatomy_dir)
+    if not name.endswith(_NII):
+        raise ValueError(f"expected a {_NII} file, got {path}")
+    stems = {n[: -len(_NII)] for n in os.listdir(sub_dir) if n.endswith(_NII)}
+    info = classify_file(name, stems)
+    if info["role"] == "raw":
+        if target == "raw":
+            raise ValueError(
+                f"{name} is already fully sampled (raw); use --target md to "
+                f"denoise + bias-correct it")
+        phrase, artifact, severity = "fully sampled", "clean", None
+    elif info["role"] == "artifact":
+        phrase = _input_phrase(info["artifact"])
+        artifact, severity = info["artifact"], info["severity"]
+    else:
+        raise ValueError(
+            f"{name} is a {info['role']} output file, not a model input")
+    zooms, planes = _read_header(path)
+    if parse_acquisition(acq)[0] in SINGLE_PLANE_SEQUENCES:
+        thin_axes = [int(np.argmax(zooms))]
+    else:
+        thin_axes = [0, 1, 2]
+    target_prompt = build_target_prompt(target, anatomy, acq, zooms)
+    return {"prompt": f"Input: {phrase} {anatomy} MRI. Target: {target_prompt}",
+            "anatomy": anatomy, "acquisition": acq, "subject": subject,
+            "artifact": artifact, "severity": severity,
+            "thin_axes": thin_axes, "axis_planes": planes}
+
+
+# --------------------------------------------------------------------------
+# Volume loading / normalization / cropping
+# --------------------------------------------------------------------------
+
+def load_volume(path: str) -> np.ndarray:
+    """Load a NIfTI as a float32 array (no scaling, no reorientation)."""
+    return np.asanyarray(nib.load(path).dataobj).astype(np.float32)
+
+
+def volume_window(vol: np.ndarray, percentiles=(0.5, 99.5),
+                  max_voxels: int = 2_000_000):
+    """`(lo, hi)` intensities that `normalize_volume` maps to 0 and 1 for
+    this volume: its `percentiles`, estimated on a fixed random subsample of
+    at most `max_voxels` voxels. Falls back to (min, max) for a degenerate
+    percentile window. Inference uses it to undo the normalization."""
+    vol = np.asarray(vol, dtype=np.float32)
+    flat = vol.reshape(-1)
+    if flat.size > max_voxels:
+        idx = np.random.default_rng(0).integers(0, flat.size, size=max_voxels)
+        flat = flat[idx]
+    lo, hi = np.percentile(flat, percentiles)
+    if hi <= lo:
+        lo, hi = float(vol.min()), float(vol.max())
+    return float(lo), float(hi)
+
+
+def normalize_volume(vol: np.ndarray, percentiles=(0.5, 99.5), clip=True,
+                     max_voxels: int = 2_000_000) -> np.ndarray:
+    """Per-volume robust intensity normalization to [0, 1].
+
+    `lo, hi` are the given percentiles of *this* volume (estimated on a
+    fixed random subsample of at most `max_voxels` voxels, so a 512^3 volume
+    costs milliseconds rather than seconds), mapped to 0 and 1. With `clip`
+    the result is clamped to [0, 1]; the few voxels above `hi` saturate.
+    """
+    vol = np.asarray(vol, dtype=np.float32)
+    lo, hi = volume_window(vol, percentiles, max_voxels)
+    if hi <= lo:
+        return np.zeros_like(vol)
+    out = (vol - lo) / (hi - lo)
+    if clip:
+        np.clip(out, 0.0, 1.0, out=out)
+    return out.astype(np.float32, copy=False)
+
+
+def _crop(vol, start, shape):
+    return vol[tuple(slice(s, s + n) for s, n in zip(start, shape))]
 
 
 def build_augmentation(
@@ -158,199 +485,160 @@ def build_augmentation(
 ):
     """Build a TorchIO transform that adds random MR noise + ghosting.
 
-    Operates on a single (C, W, H, D) float tensor (the canonical patch layout
-    here is (1, *patch_shape)) and returns one of the same shape. Intended to
-    be applied to the *condition* (input) only, so the target stays a clean
-    reconstruction goal.
-
-    Args:
-        noise_std: std range for `RandomNoise` (sigma ~ U(a, b)). Noise is in
-            the same intensity units as the patch, so keep this small relative
-            to your data's intensity range.
-        ghost_num: range for the number of ghosts (n ~ U(a, b)).
-        ghost_intensity: artifact-strength range relative to k-space max
-            (s ~ U(a, b)).
-        ghost_axes: spatial axis/axes (of W, H, D = 0, 1, 2) along which
-            ghosts may appear; one is chosen at random per sample. The slab
-            (D=2) axis is excluded by default since ghosting along a 16-slice
-            slab is rarely meaningful.
-        p_noise, p_ghost: per-sample probability of applying each transform.
-
-    Returns:
-        A `torchio.Transform` (Compose). Pass `None` for either probability's
-        transform to be skipped by setting the corresponding `p_*` to 0.
+    Operates on a single (C, W, H, D) float tensor and returns one of the
+    same shape. Intended to be applied to the *condition* (input) only, so
+    the target stays a clean reconstruction goal. Intensities are in the
+    normalized [0, 1] range, so `noise_std` is relative to that.
     """
     transforms = []
     if p_noise > 0:
-        transforms.append(
-            tio.RandomNoise(mean=0.0, std=noise_std, p=p_noise)
-        )
+        transforms.append(tio.RandomNoise(mean=0.0, std=noise_std, p=p_noise))
     if p_ghost > 0:
         transforms.append(
-            tio.RandomGhosting(
-                num_ghosts=ghost_num,
-                axes=ghost_axes,
-                intensity=ghost_intensity,
-                p=p_ghost,
-            )
+            tio.RandomGhosting(num_ghosts=ghost_num, axes=ghost_axes,
+                               intensity=ghost_intensity, p=p_ghost)
         )
     return tio.Compose(transforms) if transforms else None
 
 
-class PatchPairDataset(Dataset):
-    """One sample = (condition, target, prompt, target_type, anatomy, artifact).
+class VolumePairDataset(Dataset):
+    """One item = `patches_per_volume` aligned patches from one volume pair.
 
-    Each volume tensor is shape (1, *patch_shape) (default (1, 192, 192, 16)).
-    `prompt` is the composed "Input: ... Target: ..." text description (see
-    `build_samples` / `_input_phrase`), e.g. "Input: grappa undersampled knee
-    MRI. Target: Fully sampled coronal 1.5T knee Proton Density MRI ..." or
-    "Input: fully sampled knee MRI. Target: Denoised and biascorrected ...".
-    Tokenization happens in the training script, keeping this module free of
-    any text-encoder dependency.
+    Returns `(condition, target, prompts, target_type, anatomy, artifact)`
+    with `condition`/`target` of shape `(K, 1, *patch_shape)` and `prompts`
+    a list of K strings -- the sample's prompt template with `{plane}` filled
+    by the plane of each patch's thin axis (`axis_planes`). Use
+    `collate_patches` to flatten a batch of items into `(B*K, 1, ...)`.
 
-    `patch_shape` center-crops both the condition and target after they are
-    loaded. Both members of a pair share the same patch coordinate so their
-    spatial alignment is preserved.
+    Both volumes are normalized independently (`normalize_volume`) and then
+    cropped at the same coordinates. For each patch the thin axis is drawn
+    uniformly from the sample's feasible `thin_axes` (see module docstring)
+    and moved last, so the output is always `(K, 1, *patch_shape)`. Crops
+    that are mostly air (fewer than `fg_fraction` of target voxels above
+    `fg_threshold`) are re-drawn up to `max_tries` times; the best attempt
+    is kept otherwise.
 
-    `augment` is an optional TorchIO transform (see `build_augmentation`)
-    applied to the *condition only*. The target is never augmented so it
-    remains a clean restoration goal.
+    `deterministic=True` (validation) seeds the crop RNG by item index so
+    every epoch scores the same patches. `augment` (TorchIO, see
+    `build_augmentation`) is applied to each condition patch only.
+
+    After each `__getitem__`, `last_crops` holds `[(thin_axis, start), ...]`
+    for the patches just drawn (debug/visualization aid; per worker process).
     """
 
-    def __init__(self, samples, patch_shape=(192, 192, 16), augment=None):
+    def __init__(self, samples, patch_shape=(96, 96, 7), patches_per_volume=4,
+                 augment=None, norm_percentiles=(0.5, 99.5),
+                 deterministic=False, fg_threshold=0.05, fg_fraction=0.25,
+                 max_tries=10, seed=0):
         self.samples = samples
-        self.patch_shape = patch_shape
+        self.patch_shape = tuple(patch_shape)
+        self.patches_per_volume = int(patches_per_volume)
         self.augment = augment
+        self.norm_percentiles = norm_percentiles
+        self.deterministic = deterministic
+        self.fg_threshold = fg_threshold
+        self.fg_fraction = fg_fraction
+        self.max_tries = max_tries
+        self.seed = seed
+        self.last_crops = []
 
     def __len__(self):
         return len(self.samples)
 
+    def _load(self, path):
+        return normalize_volume(load_volume(path), self.norm_percentiles)
+
+    def _crop_shape(self, axis):
+        """Crop extent in array order with the thin dimension at `axis`."""
+        inplane = list(self.patch_shape[:2])
+        return tuple(self.patch_shape[2] if a == axis else inplane.pop(0)
+                     for a in range(3))
+
+    def _feasible_axes(self, vol_shape, thin_axes):
+        return [a for a in thin_axes
+                if all(n >= p for n, p in zip(vol_shape, self._crop_shape(a)))]
+
+    def _rng(self, idx):
+        return (np.random.default_rng(self.seed + idx) if self.deterministic
+                else np.random.default_rng())
+
+    def _draw_axes(self, rng, vol_shape, thin_axes):
+        """One thin axis per patch, drawn first so it is reproducible."""
+        feasible = self._feasible_axes(vol_shape, thin_axes)
+        if not feasible:
+            raise ValueError(
+                f"no thin axis in {thin_axes} lets a {self.patch_shape} patch "
+                f"fit a volume of shape {tuple(vol_shape)}")
+        return [feasible[int(rng.integers(0, len(feasible)))]
+                for _ in range(self.patches_per_volume)]
+
+    def thin_axes_used(self, idx):
+        """Thin axes `self[idx]` will draw (exact only when `deterministic`)."""
+        s = self.samples[idx]
+        shape = nib.load(s["target_path"]).shape[:3]
+        return self._draw_axes(self._rng(idx), shape, s.get("thin_axes", [2]))
+
+    def _draw_start(self, rng, shape, crop_shape):
+        return tuple(int(rng.integers(0, n - p + 1))
+                     for n, p in zip(shape, crop_shape))
+
     def __getitem__(self, idx):
         s = self.samples[idx]
-        condition = _load_patch(s["condition_path"], self.patch_shape)
-        target = _load_patch(s["target_path"], self.patch_shape)
+        cond = self._load(s["condition_path"])
+        tgt = self._load(s["target_path"])
+        if cond.shape != tgt.shape:
+            raise ValueError(
+                f"condition/target shape mismatch {cond.shape} vs {tgt.shape}: "
+                f"{s['condition_path']} / {s['target_path']}")
+        rng = self._rng(idx)
+        axes = self._draw_axes(rng, tgt.shape, s.get("thin_axes", [2]))
+        planes = s.get("axis_planes", DEFAULT_AXIS_PLANES)
+        prompts = [s["prompt"].format(plane=planes[a]) for a in axes]
+        cond_patches, tgt_patches, crops = [], [], []
+        for axis in axes:
+            crop_shape = self._crop_shape(axis)
+            best, best_fg = None, -1.0
+            for _ in range(self.max_tries):
+                start = self._draw_start(rng, tgt.shape, crop_shape)
+                fg = float((_crop(tgt, start, crop_shape) > self.fg_threshold).mean())
+                if fg > best_fg:
+                    best, best_fg = start, fg
+                if fg >= self.fg_fraction:
+                    break
+            c = torch.from_numpy(np.ascontiguousarray(
+                np.moveaxis(_crop(cond, best, crop_shape), axis, -1))).unsqueeze(0)
+            t = torch.from_numpy(np.ascontiguousarray(
+                np.moveaxis(_crop(tgt, best, crop_shape), axis, -1))).unsqueeze(0)
+            if self.augment is not None:
+                c = self.augment(c)
+            cond_patches.append(c)
+            tgt_patches.append(t)
+            crops.append((axis, best))
+        self.last_crops = crops
 
-        if self.augment is not None:
-            condition = self.augment(condition)
-
-        # target_type names the prompt capability this pair exercises:
-        # "raw" = "Fully sampled ..." target, "denoised" = "Denoised and
-        # biascorrected ..." target. Used by validation to score both equally.
-        target_type = "raw" if s["task"] == "artifact2raw" else "denoised"
-        return condition, target, s["prompt"], target_type, s["anatomy"], s["artifact"]
+        return (torch.stack(cond_patches), torch.stack(tgt_patches),
+                prompts, s["target_type"], s["anatomy"], s["artifact"])
 
 
-def _find_artifact_siblings(subjects, raw_name: str):
-    """Artifact dirs of `raw_name`: `<raw_name>_<artifact-suffix>`."""
-    out = []
-    for d in subjects:
-        if not d.startswith(raw_name):
-            continue
-        rest = d[len(raw_name):]
-        if _ARTIFACT_SUFFIX_RE.fullmatch(rest):
-            out.append(d)
-    return sorted(out)
+def collate_patches(batch):
+    """Flatten a batch of `(K,1,...)` items into `(B*K,1,...)` tensors; the
+    per-patch prompt lists are concatenated and the other string fields are
+    repeated K times so everything stays aligned."""
+    cond = torch.cat([b[0] for b in batch], dim=0)
+    tgt = torch.cat([b[1] for b in batch], dim=0)
+    prompts, ttypes, anatomies, artifacts = [], [], [], []
+    for b in batch:
+        k = b[0].shape[0]
+        prompts.extend(b[2])
+        ttypes.extend([b[3]] * k)
+        anatomies.extend([b[4]] * k)
+        artifacts.extend([b[5]] * k)
+    return cond, tgt, prompts, ttypes, anatomies, artifacts
 
 
-def build_samples(data_root: str, split: str, anatomy: str):
-    """Enumerate (condition, target, prompt) patch pairs for one anatomy.
-
-    Iterates every acquisition folder under `<data_root>/<split>/<anatomy>/`,
-    pairing each raw subject's artifact / raw / denoised patches across the
-    three restoration tasks (see module docstring).
-
-    Returns:
-        samples: list of dicts {condition_path, target_path, prompt, task}.
-    """
-    anatomy_dir = os.path.join(data_root, split, anatomy)
-    if not os.path.isdir(anatomy_dir):
-        raise FileNotFoundError(f"Anatomy directory not found: {anatomy_dir}")
-
-    samples = []
-    acquisitions = sorted(
-        d for d in os.listdir(anatomy_dir)
-        if os.path.isdir(os.path.join(anatomy_dir, d))
-    )
-
-    for acq in acquisitions:
-        acq_dir = os.path.join(anatomy_dir, acq)
-        subjects = sorted(
-            d for d in os.listdir(acq_dir)
-            if os.path.isdir(os.path.join(acq_dir, d))
-        )
-        subj_set = set(subjects)
-
-        for name in subjects:
-            sub_dir = os.path.join(acq_dir, name)
-            # Raw GT subjects own the pairing; skip denoised/artifact dirs here.
-            if name.startswith(_DENOISED_PREFIX) or not _has_prompt(sub_dir, name):
-                continue
-            try:
-                raw_prompt, processing = _read_prompt(sub_dir, name)
-            except (KeyError, json.JSONDecodeError):
-                continue
-            if processing != "raw":
-                continue
-
-            raw_patches = _index_subject_patches(sub_dir)
-            if not raw_patches:
-                continue
-
-            # Optional denoised + bias-corrected counterpart `md<subject>`.
-            den_name = f"{_DENOISED_PREFIX}{name}"
-            den_patches, den_prompt = {}, None
-            if den_name in subj_set:
-                den_dir = os.path.join(acq_dir, den_name)
-                if _has_prompt(den_dir, den_name):
-                    try:
-                        den_prompt, _ = _read_prompt(den_dir, den_name)
-                        den_patches = _index_subject_patches(den_dir)
-                    except (KeyError, json.JSONDecodeError):
-                        den_patches, den_prompt = {}, None
-
-            # Tasks 1 & 2: artifact -> raw, artifact -> denoised.
-            for art in _find_artifact_siblings(subjects, name):
-                art_family = _artifact_family(art[len(name):])
-                input_phrase = _input_phrase(art_family)
-                art_patches = _index_subject_patches(os.path.join(acq_dir, art))
-                for coord, art_path in art_patches.items():
-                    if coord in raw_patches:
-                        samples.append({
-                            "condition_path": art_path,
-                            "target_path": raw_patches[coord],
-                            "prompt": f"Input: {input_phrase} {anatomy} MRI. "
-                                      f"Target: {raw_prompt}",
-                            "task": "artifact2raw",
-                            "anatomy": anatomy,
-                            "artifact": art_family,
-                        })
-                    if den_prompt is not None and coord in den_patches:
-                        samples.append({
-                            "condition_path": art_path,
-                            "target_path": den_patches[coord],
-                            "prompt": f"Input: {input_phrase} {anatomy} MRI. "
-                                      f"Target: {den_prompt}",
-                            "task": "artifact2denoised",
-                            "anatomy": anatomy,
-                            "artifact": art_family,
-                        })
-
-            # Task 3: raw -> denoised.
-            if den_prompt is not None:
-                for coord, raw_path in raw_patches.items():
-                    if coord in den_patches:
-                        samples.append({
-                            "condition_path": raw_path,
-                            "target_path": den_patches[coord],
-                            "prompt": f"Input: fully sampled {anatomy} MRI. "
-                                      f"Target: {den_prompt}",
-                            "task": "raw2denoised",
-                            "anatomy": anatomy,
-                            "artifact": "clean",
-                        })
-
-    return samples
-
+# --------------------------------------------------------------------------
+# Dataset assembly
+# --------------------------------------------------------------------------
 
 def _subsample(samples, percent: float, seed: int = 42):
     """Return a deterministic random subset of `samples` (percent in [0, 100])."""
@@ -366,8 +654,7 @@ def _filter_artifacts(samples, artifacts):
 
     `artifacts` is an iterable of artifact families to keep (a subset of
     {undersampled, spike, aniso}). The clean `raw->denoised` task (artifact
-    == "clean") is always retained regardless of the filter, so a specialized
-    model still learns pure denoising alongside artifact removal. Pass
+    == "clean") is always retained regardless of the filter. Pass
     `artifacts=None` to disable filtering entirely.
     """
     if artifacts is None:
@@ -378,87 +665,76 @@ def _filter_artifacts(samples, artifacts):
 
 
 def get_dataset_3d_patches(data_root: str, contrast, sample: float = 100.0,
-                           patch_shape=(192, 192, 16), augment=None,
-                           artifacts=None):
+                           patch_shape=(96, 96, 7), augment=None,
+                           artifacts=None, val_fraction: float = 0.10,
+                           split_seed: int = 42, patches_per_volume: int = 4,
+                           norm_percentiles=(0.5, 99.5), fg_fraction: float = 0.25):
     """Build train + val datasets for one or more anatomies.
 
-    `contrast` is the anatomy group (one of {brain, knee, prostate}) or a
-    list/tuple of them. When multiple are given, samples are concatenated.
+    `contrast` is the anatomy (one of {brain, knee, prostate}) or a list of
+    them; samples are concatenated. `sample` keeps a random percentage of the
+    train *pairs* (val is always used whole -- it is small).
 
-    `patch_shape` is forwarded to both datasets and center-crops each loaded
-    patch (default (192, 192, 16) = no crop). Use e.g. (96, 96, 16) for fast
-    debugging.
+    Validation is a patient-level `val_fraction` split of `data_root` (see
+    `build_samples`); the held-out test root is not touched.
 
-    `augment` is an optional TorchIO transform (see `build_augmentation`)
-    applied to the *condition only*, on both the train and val datasets.
-
-    `artifacts` optionally restricts which artifact families are used (a subset
-    of {undersampled, spike, aniso}); the clean `raw->denoised` pairs are always
-    kept. `None` (default) keeps every artifact. Applied to both splits, so a
-    specialized model is validated on the same artifacts it trains on (+ clean).
+    `artifacts` optionally restricts artifact families (clean pairs always
+    kept), applied to both splits.
 
     The returned datasets carry two index maps for the balanced sampler:
-      * `contrast_indices` -- keyed by anatomy name, for balancing across
-        anatomies (the default).
-      * `group_indices` -- keyed by the `(anatomy, artifact)` pair, for
-        balancing across every anatomy x artifact group (e.g. equal numbers of
-        undersampled-brain, undersampled-knee, spike-brain, ...).
-
-    Train comes from `train/`, validation from `test/`.
+      * `contrast_indices` -- keyed by anatomy name.
+      * `group_indices`    -- keyed by `(anatomy, artifact)`.
+    Quotas drawn from these count volume pairs; each pair yields
+    `patches_per_volume` patches.
     """
     contrasts = [contrast] if isinstance(contrast, str) else list(contrast)
 
-    train_samples_all, val_samples_all = [], []
-    train_contrast_indices, val_contrast_indices = {}, {}
-
+    train_all, val_all = [], []
+    train_ci, val_ci = {}, {}
     for c in contrasts:
-        tr_samples = _filter_artifacts(build_samples(data_root, "train", c), artifacts)
-        v_samples = _filter_artifacts(build_samples(data_root, "test", c), artifacts)
+        tr = _filter_artifacts(
+            build_samples(data_root, c, "train", val_fraction, split_seed), artifacts)
+        va = _filter_artifacts(
+            build_samples(data_root, c, "val", val_fraction, split_seed), artifacts)
+        if not tr:
+            art_note = (f" with --artifact {sorted(artifacts)}"
+                        if artifacts is not None else "")
+            raise ValueError(
+                f"No (condition, target) volume pairs found for anatomy "
+                f"'{c}'{art_note} in {os.path.join(data_root, c)}. Expected "
+                f"<acq>/<subject>/<stem>.nii.gz plus md<stem> and/or artifact "
+                f"(_R*/_SPIKE_R*/_ANISO_*/r*_lowres) siblings.")
+        if not va:
+            print(f"warning: anatomy '{c}' has no validation pairs "
+                  f"(val_fraction={val_fraction}, too few patients?)")
+        tr = _subsample(tr, sample, seed=42)
 
-        for split_name, split_samples in (("train", tr_samples), ("test", v_samples)):
-            if not split_samples:
-                art_note = (f" with --artifact {sorted(artifacts)}"
-                            if artifacts is not None else "")
-                raise ValueError(
-                    f"No (condition, target) patch pairs found for anatomy "
-                    f"'{c}'{art_note} in {os.path.join(data_root, split_name, c)}. "
-                    f"Check that raw subject dirs contain patch_*.nii.gz plus a "
-                    f"<subject>.json prompt sidecar, and that artifact "
-                    f"(_R*/_SPIKE_R*/_ANISO_*) and md<subject> dirs exist. "
-                    f"If filtering by artifact, this anatomy may not carry the "
-                    f"requested family."
-                )
-
-        tr_samples = _subsample(tr_samples, sample, seed=42)
-        v_samples = _subsample(v_samples, min(sample, 5.0), seed=43)
-
-        train_contrast_indices[c] = list(
-            range(len(train_samples_all), len(train_samples_all) + len(tr_samples))
-        )
-        val_contrast_indices[c] = list(
-            range(len(val_samples_all), len(val_samples_all) + len(v_samples))
-        )
-
-        train_samples_all.extend(tr_samples)
-        val_samples_all.extend(v_samples)
+        train_ci[c] = list(range(len(train_all), len(train_all) + len(tr)))
+        val_ci[c] = list(range(len(val_all), len(val_all) + len(va)))
+        train_all.extend(tr)
+        val_all.extend(va)
 
     def _group_indices(samples):
-        """Map (anatomy, artifact) -> list of dataset indices."""
         groups = {}
         for i, s in enumerate(samples):
             groups.setdefault((s["anatomy"], s["artifact"]), []).append(i)
         return groups
 
-    train_set = PatchPairDataset(train_samples_all,
-                                 patch_shape=patch_shape, augment=augment)
-    val_set = PatchPairDataset(val_samples_all,
-                               patch_shape=patch_shape, augment=augment)
-    train_set.contrast_indices = train_contrast_indices
-    val_set.contrast_indices = val_contrast_indices
-    train_set.group_indices = _group_indices(train_samples_all)
-    val_set.group_indices = _group_indices(val_samples_all)
+    common = dict(patch_shape=patch_shape, patches_per_volume=patches_per_volume,
+                  augment=augment, norm_percentiles=norm_percentiles,
+                  fg_fraction=fg_fraction)
+    train_set = VolumePairDataset(train_all, deterministic=False, **common)
+    val_set = VolumePairDataset(val_all, deterministic=True, **common)
+    train_set.contrast_indices = train_ci
+    val_set.contrast_indices = val_ci
+    train_set.group_indices = _group_indices(train_all)
+    val_set.group_indices = _group_indices(val_all)
     return train_set, val_set
 
+
+# --------------------------------------------------------------------------
+# Balanced sampling / quotas (unchanged: groups now count volume pairs)
+# --------------------------------------------------------------------------
 
 class BalancedDistributedSampler(Sampler):
     """Yields an equal number of samples per group each epoch.
@@ -721,59 +997,42 @@ def getloader_3d_patches(
     train_shuffle: bool = True,
     samples_per_contrast=None,
     balance_by: str = "anatomy",
-    patch_shape=(192, 192, 16),
+    patch_shape=(96, 96, 7),
     augment=None,
     augment_kwargs=None,
     artifacts=None,
     artifact_fraction=None,
     anatomy_weight=None,
+    val_fraction: float = 0.10,
+    split_seed: int = 42,
+    patches_per_volume: int = 4,
+    norm_percentiles=(0.5, 99.5),
+    fg_fraction: float = 0.25,
 ):
-    """DataLoaders for 3D NIfTI patch restoration. DDP-aware.
+    """DataLoaders for whole-volume NIfTI patch restoration. DDP-aware.
+
+    `batch_size` counts *volume pairs*; every step yields
+    `batch_size * patches_per_volume` patches of `patch_shape` (flattened by
+    `collate_patches`), each pair's prompt repeated per patch.
 
     `contrast` is the anatomy group (one of {brain, knee, prostate}) or a
     list/tuple of them.
 
-    `patch_shape` center-crops each loaded patch (default (192, 192, 16) = no
-    crop; pass e.g. (96, 96, 16) for fast model debugging).
-
     Augmentation (random MR noise + ghosting) is applied to the *condition
     only*, on both train and val:
       - `augment`: pass a ready-made TorchIO transform to use it directly.
-      - `augment_kwargs`: pass a dict of `build_augmentation` kwargs (e.g.
-        `{"noise_std": (0, 0.05), "p_ghost": 0.3}`) to build one here.
+      - `augment_kwargs`: pass a dict of `build_augmentation` kwargs.
       - If both are None (default), no augmentation is applied.
-    `augment` takes precedence if both are given.
 
     If `samples_per_contrast` is not None, training uses
     `BalancedDistributedSampler`: each balancing group contributes the same
-    number of samples per epoch (0 = auto-balance to the smallest group).
-    Larger groups cycle through different random subsets across epochs.
-    Validation always uses standard sampling.
+    number of *pairs* per epoch (0 = auto-balance to the smallest group).
+    `balance_by` is "anatomy" or "anatomy_artifact". `artifacts`,
+    `artifact_fraction` and `anatomy_weight` behave as documented in
+    `get_dataset_3d_patches` / `_build_group_quota`.
 
-    `balance_by` selects the grouping:
-      * "anatomy"          -- equal samples per anatomy (default; mixes the
-                              natural artifact distribution within each anatomy).
-      * "anatomy_artifact" -- equal samples per `(anatomy, artifact)` group,
-                              e.g. 5000 undersampled-brain, 5000 undersampled-
-                              knee, 5000 spike-brain, ... each epoch.
-
-    `artifacts` optionally restricts which artifact families are used (a subset
-    of {undersampled, spike, aniso}); clean `raw->denoised` pairs are always
-    kept. `None` (default) keeps every artifact. See `get_dataset_3d_patches`.
-
-    `artifact_fraction` optionally up-weights one artifact family to a fixed
-    fraction of each anatomy's per-epoch samples. Pass `(family, frac)`, e.g.
-    `("aniso", 0.7)`: every other group keeps `samples_per_contrast`, and the
-    family's group is enlarged so it makes up `frac` of that anatomy's samples
-    (see `_build_group_quota`). Requires `balance_by="anatomy_artifact"`
-    and a positive `samples_per_contrast`. `None` (default) keeps equal groups.
-
-    `anatomy_weight` optionally re-divides the epoch into fixed per-anatomy
-    target fractions, e.g. `{"brain": 0.1, "knee": 0.45, "prostate": 0.45}`.
-    The epoch size is held at `samples_per_contrast * <#groups>` and split so
-    each anatomy gets its fraction (artifacts uniform within, unless
-    `artifact_fraction` also skews them). `None` (default) = equal groups.
-    Must cover every trained anatomy and sum to 1.0 (see `_build_group_quota`).
+    `val_fraction` / `split_seed` control the patient-level val split inside
+    `data_root`; `norm_percentiles` the per-volume normalization.
     """
     if balance_by not in ("anatomy", "anatomy_artifact"):
         raise ValueError(
@@ -784,7 +1043,9 @@ def getloader_3d_patches(
 
     train_set, val_set = get_dataset_3d_patches(
         data_root, contrast, sample, patch_shape, augment=augment,
-        artifacts=artifacts,
+        artifacts=artifacts, val_fraction=val_fraction, split_seed=split_seed,
+        patches_per_volume=patches_per_volume, norm_percentiles=norm_percentiles,
+        fg_fraction=fg_fraction,
     )
 
     use_balanced = samples_per_contrast is not None
@@ -822,6 +1083,8 @@ def getloader_3d_patches(
     else:
         train_sampler = None
 
+    common = dict(num_workers=num_workers, pin_memory=True,
+                  collate_fn=collate_patches)
     if distributed:
         val_sampler = DistributedSampler(
             val_set, num_replicas=world_size, rank=rank,
@@ -829,65 +1092,57 @@ def getloader_3d_patches(
         )
         train_loader = DataLoader(
             train_set, batch_size=batch_size, sampler=train_sampler,
-            num_workers=num_workers, pin_memory=True, drop_last=True,
+            drop_last=True, **common,
         )
         val_loader = DataLoader(
             val_set, batch_size=batch_size, sampler=val_sampler,
-            num_workers=num_workers, pin_memory=True, drop_last=False,
+            drop_last=False, **common,
         )
     else:
         train_loader = DataLoader(
-            train_set, batch_size=batch_size,
-            sampler=train_sampler,
-            shuffle=(train_sampler is None) and train_shuffle,
-            num_workers=num_workers, pin_memory=True,
+            train_set, batch_size=batch_size, sampler=train_sampler,
+            shuffle=(train_sampler is None) and train_shuffle, **common,
         )
         val_loader = DataLoader(
-            val_set, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=True,
+            val_set, batch_size=batch_size, shuffle=False, **common,
         )
 
     return train_loader, val_loader
 
 
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
+    import sys
+    import time
     from collections import Counter
 
-    data_root = "/vast/tibrahim/jil202/data"
-    anatomy = "knee"
+    data_root = "/vast/tibrahim/jil202/nii"
+    anatomy = sys.argv[1] if len(sys.argv) > 1 else "brain"
 
-    print(f"Building datasets for anatomy={anatomy} ...")
+    print(f"Building datasets for anatomy={anatomy} under {data_root} ...")
+    t0 = time.time()
     train_set, val_set = get_dataset_3d_patches(
-        data_root, anatomy, sample=100.0, patch_shape=(192, 192, 16),
+        data_root, anatomy, sample=100.0, patch_shape=(96, 96, 7),
     )
-    task_counts = Counter(s["task"] for s in train_set.samples)
-    print(f"train pairs: {len(train_set)}, val pairs: {len(val_set)}")
-    print(f"train task breakdown: {dict(task_counts)}")
+    print(f"indexed in {time.time() - t0:.1f}s: train pairs {len(train_set)}, "
+          f"val pairs {len(val_set)}")
+    print(f"train patients {len({s['patient'] for s in train_set.samples})}, "
+          f"val patients {len({s['patient'] for s in val_set.samples})}")
+    print("train task breakdown:", dict(Counter(s["task"] for s in train_set.samples)))
+    print("train group breakdown:",
+          dict(Counter((s["acquisition"], s["artifact"]) for s in train_set.samples)))
 
     train_loader, _ = getloader_3d_patches(
-        batch_size=1, data_root=data_root, contrast=anatomy,
-        sample=1.0, num_workers=0, patch_shape=(96, 96, 16),
+        batch_size=2, data_root=data_root, contrast=anatomy,
+        sample=100.0, num_workers=0, patch_shape=(96, 96, 7),
     )
-    for condition, target, prompts, target_types, *_ in train_loader:
+    t0 = time.time()
+    for i, (condition, target, prompts, target_types, *_) in enumerate(train_loader):
         print(
-            f"condition  {tuple(condition.shape)}  range "
-            f"[{condition.min():.4f}, {condition.max():.4f}]\n"
-            f"target     {tuple(target.shape)}  range "
-            f"[{target.min():.4f}, {target.max():.4f}]\n"
-            f"target_type {target_types[0]!r}\n"
-            f"prompt     {prompts[0]!r}"
+            f"batch {i}: condition {tuple(condition.shape)} range "
+            f"[{condition.min():.3f}, {condition.max():.3f}]  target "
+            f"{tuple(target.shape)} range [{target.min():.3f}, {target.max():.3f}]  "
+            f"{time.time() - t0:.2f}s\n  prompt: {prompts[0]!r}"
         )
-        c = condition[0, 0, :, :, condition.shape[-1] // 2].cpu().numpy()
-        t = target[0, 0, :, :, target.shape[-1] // 2].cpu().numpy()
-        plt.figure(figsize=(8, 4))
-        for i, (img, name) in enumerate([(c, "condition"), (t, "target")]):
-            plt.subplot(1, 2, i + 1)
-            plt.imshow(img, cmap="gray")
-            plt.title(name)
-            plt.axis("off")
-        plt.tight_layout()
-        plt.savefig("dataset_smoketest.png")
-        plt.close()
-        print("Saved dataset_smoketest.png")
-        break
+        t0 = time.time()
+        if i == 2:
+            break

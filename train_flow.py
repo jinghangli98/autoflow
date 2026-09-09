@@ -12,15 +12,15 @@ predicts a velocity field of shape `(B, 1, X, Y, Z)`.
 
 The target's text prompt is injected via cross-attention so it tells the model
 which output to produce ("Fully sampled ..." vs "Denoised and biascorrected
-..."). The dataset reads the ready-made prompt from each target's JSON sidecar
-(`prompt` key); a frozen RadBERT (`zzxslp/RadBERT-RoBERTa-4m`, RoBERTa-base,
+..."). The dataset composes the prompt from the acquisition folder, the NIfTI
+header and the plane of each extracted patch (see dataset.py); a frozen RadBERT (`zzxslp/RadBERT-RoBERTa-4m`, RoBERTa-base,
 hidden 768) encodes it into a `(B, seq_len, 768)` context. Classifier-free
 guidance uses the encoded empty prompt as the unconditional signal.
 
 Usage:
     python -m torch.distributed.run --nproc_per_node=8 train_flow.py \
         --contrast brain knee prostate \
-        --data_root /vast/tibrahim/jil202/data \
+        --data_root /vast/tibrahim/jil202/nii \
         --distributed --fp16 --save_model --compile \
         --batch_size 4 --max_epochs 100 --sample 100 \
         --num_sampling_steps 2
@@ -45,7 +45,7 @@ from transformers import AutoModel, AutoTokenizer
 import wandb
 import metrics_breakdown as mb
 from metrics import evaluate_image_quality
-from utils import EMA
+from utils import EMA, checkpoint_state, cosine_warmup_lambda, crop_depth, pad_depth, relaxed_state_dict
 
 
 TEXT_ENCODER_NAME = "zzxslp/RadBERT-RoBERTa-4m"
@@ -151,7 +151,8 @@ class TextConditioner(nn.Module):
 class FlowMatcher(nn.Module):
     """Flow Matching for 3D patch translation, with context conditioning."""
 
-    def __init__(self, model, sigma_min=0.001, logvar_clamp=7.0):
+    def __init__(self, model, sigma_min=0.001, logvar_clamp=7.0,
+                 depth_multiple=4):
         super().__init__()
         self.model = model
         self.sigma_min = sigma_min
@@ -159,6 +160,13 @@ class FlowMatcher(nn.Module):
         # per-voxel log-variance of the velocity (heteroscedastic uncertainty,
         # UA-Flow style). logvar is clamped for numerical stability.
         self.logvar_clamp = logvar_clamp
+        # Thin patches (Z=7) are replicate-padded to a multiple of the
+        # UNet's total downsampling factor (2 levels -> 4) and cropped back.
+        self.depth_multiple = depth_multiple
+
+    def _unet(self, model_input, timesteps, context):
+        x, z0 = pad_depth(model_input, self.depth_multiple)
+        return crop_depth(self.model(x, timesteps, context=context), z0)
 
     def forward(self, x0, x1, condition, t, context=None, use_nll=True):
         """Flow matching loss on a 3D patch with a heteroscedastic variance head.
@@ -190,7 +198,7 @@ class FlowMatcher(nn.Module):
         timesteps = (t * 999).long()
         model_input = torch.cat([x_t, condition], dim=1)
 
-        out = self.model(model_input, timesteps, context=context)
+        out = self._unet(model_input, timesteps, context=context)
         v_pred = out[:, 0:1]
         logvar = out[:, 1:2].clamp(-self.logvar_clamp, self.logvar_clamp)
         se = (v_pred - v_t) ** 2
@@ -211,11 +219,11 @@ class FlowMatcher(nn.Module):
         The returned logvar is the conditional branch's (or the unconditional
         branch's when guidance_scale == 0.0).
         """
-        out_c = self.model(model_input, timesteps, context=context)
+        out_c = self._unet(model_input, timesteps, context=context)
         v_cond, logvar = out_c[:, 0:1], out_c[:, 1:2]
         if guidance_scale == 1.0 or null_context is None:
             return v_cond, logvar
-        out_u = self.model(model_input, timesteps, context=null_context)
+        out_u = self._unet(model_input, timesteps, context=null_context)
         v_uncond = out_u[:, 0:1]
         if guidance_scale == 0.0:
             return v_uncond, out_u[:, 1:2]
@@ -260,7 +268,7 @@ def parse_args():
 
     # Data
     parser.add_argument("--data_root", type=str,
-                        default="/vast/tibrahim/jil202/data",
+                        default="/vast/tibrahim/jil202/nii",
                         help="Root containing train/<anatomy>/ and test/<anatomy>/")
     parser.add_argument("--contrast", type=str, required=True, nargs="+",
                         choices=["brain", "knee", "prostate"],
@@ -299,11 +307,26 @@ def parse_args():
                              "pretrained weights from catastrophic forgetting).")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--patches_per_volume", type=int, default=4,
+                        help="Random patches drawn per volume pair each time it "
+                             "is visited; a step holds batch_size * this many "
+                             "patches (default 4).")
+    parser.add_argument("--val_fraction", type=float, default=0.10,
+                        help="Patient-level fraction of --data_root held out "
+                             "for validation (default 0.10). The separate "
+                             "nii_test root is never read here.")
+    parser.add_argument("--fg_fraction", type=float, default=0.25,
+                        help="Minimum fraction of foreground target voxels for "
+                             "a crop to be accepted without a re-draw (default "
+                             "0.25). 0.0 accepts every crop, air included.")
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--sample", type=float, default=10.0,
                         help="Percentage of (undersampled,GT) sample pairs to use")
-    parser.add_argument("--size", type=int, default=196,
-                        help="Patch size (in voxels). Actual patch shape is (size, size, 16) to ")
+    parser.add_argument("--depth", type=int, default=7,
+                        help="Patch depth in slices (default 7); the UNet "
+                             "replicate-pads Z to a multiple of 4 internally.")
+    parser.add_argument("--size", type=int, default=96,
+                        help="Patch size (in voxels). Actual patch shape is (size, size, --depth) to ")
 
     parser.add_argument("--samples_per_contrast", type=int, default=None,
                         help="If set, each balancing group contributes this "
@@ -335,7 +358,28 @@ def parse_args():
                              "The epoch is re-divided to these fractions (artifacts "
                              "uniform within each anatomy unless --artifact_fraction "
                              "also skews them). Omit for equal groups.")
-    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_interval", type=int, default=1,
+                        help="Validate (and consider saving best) every N epochs.")
+    parser.add_argument("--channels", type=int, nargs=3, default=(128, 256, 512),
+                        metavar=("C0", "C1", "C2"),
+                        help="UNet channel widths per level (default 128 256 512; "
+                             "e.g. 256 256 512 widens the full-resolution level). "
+                             "Stored in the checkpoint; inference reads it back.")
+    parser.add_argument("--run_tag", type=str, default="",
+                        help="Inserted into checkpoint names (and the W&B run "
+                             "name) so runs do not overwrite each other: "
+                             "flow_matching_3d_<contrasts>_<artifacts>_<run_tag>_best.pt")
+    parser.add_argument("--warmup_steps", type=int, default=0,
+                        help="Linear LR warmup over this many optimizer steps.")
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Total optimizer steps: the cosine LR schedule "
+                             "spans them and training stops when reached "
+                             "(default: max_epochs * steps per epoch).")
+    parser.add_argument("--lr_min", type=float, default=1e-6,
+                        help="LR floor the cosine schedule decays to.")
+    parser.add_argument("--save_last_every", type=int, default=0,
+                        help="Also write *_last.pt every N epochs (0 = off) so "
+                             "a killed job keeps its most recent weights.")
     parser.add_argument("--val_images_per_group", type=int,
                         default=mb.MIN_PER_GROUP,
                         help="Max validation images scored per (anatomy, "
@@ -402,6 +446,14 @@ def parse_args():
     args.artifact_fraction = parse_artifact_fraction(args.artifact_fraction)
     args.anatomy_weight = parse_anatomy_weight(args.anatomy_weight)
     return args
+
+
+def checkpoint_name(args, kind):
+    """./checkpoints_uncertainty/flow_matching_3d_<contrasts>_<artifacts>[_<run_tag>]_<kind>.pt"""
+    contrast_tag = "_".join(args.contrast)
+    artifact_tag = "_".join(sorted(args.artifact)) if args.artifact else "all"
+    tag = f"_{args.run_tag}" if getattr(args, "run_tag", "") else ""
+    return f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}{tag}_{kind}.pt"
 
 
 def setup_distributed(rank, world_size, local_rank, backend="nccl"):
@@ -492,7 +544,8 @@ def train(local_rank, args):
         world_size = 1
 
     if args.log and global_rank == 0:
-        wandb.init(project="FlowMatching_3D", config=vars(args))
+        wandb.init(project="FlowMatching_3D", config=vars(args),
+                   name=args.run_tag or None)
 
     if global_rank == 0:
         os.makedirs("visualization_results", exist_ok=True)
@@ -507,12 +560,15 @@ def train(local_rank, args):
             contrast=args.contrast,
             sample=args.sample,
             distributed=True, rank=global_rank, world_size=world_size,
-            num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
+            num_workers=args.num_workers, patch_shape=(args.size, args.size, args.depth),
             samples_per_contrast=args.samples_per_contrast,
             balance_by=args.balance_by,
             artifacts=args.artifact,
             artifact_fraction=args.artifact_fraction,
             anatomy_weight=args.anatomy_weight,
+            patches_per_volume=args.patches_per_volume,
+            val_fraction=args.val_fraction,
+            fg_fraction=args.fg_fraction,
         )
     else:
         train_loader, val_loader = getloader_3d_patches(
@@ -520,12 +576,15 @@ def train(local_rank, args):
             data_root=args.data_root,
             contrast=args.contrast,
             sample=args.sample,
-            num_workers=args.num_workers, patch_shape=(args.size, args.size, 16),
+            num_workers=args.num_workers, patch_shape=(args.size, args.size, args.depth),
             samples_per_contrast=args.samples_per_contrast,
             balance_by=args.balance_by,
             artifacts=args.artifact,
             artifact_fraction=args.artifact_fraction,
             anatomy_weight=args.anatomy_weight,
+            patches_per_volume=args.patches_per_volume,
+            val_fraction=args.val_fraction,
+            fg_fraction=args.fg_fraction,
         )
 
     if global_rank == 0:
@@ -557,10 +616,10 @@ def train(local_rank, args):
         spatial_dims=3,
         in_channels=2,
         out_channels=2,  # [0] velocity mean, [1] velocity log-variance
-        channels=(96, 128, 256), #original 128, 256, 512 -> 96 128 256
+        channels=tuple(args.channels),
         attention_levels=(False, False, True),
         num_res_blocks=2,
-        num_head_channels=256,
+        num_head_channels=args.channels[-1],
         with_conditioning=args.text_conditioning,
         cross_attention_dim=cross_dim,
     )
@@ -571,44 +630,22 @@ def train(local_rank, args):
         ckpt = torch.load(args.checkpoint_path, map_location=f"cuda:{local_rank}", weights_only=True)
 
         def _load_relaxed(target_module, src_sd, label):
-            tgt_sd = target_module.state_dict()
-            filtered = {}
-            skipped = []
-            partial = []
-            for k, v in src_sd.items():
-                if k not in tgt_sd:
-                    skipped.append((k, tuple(v.shape), None))
-                    continue
-                tv = tgt_sd[k]
-                if v.shape == tv.shape:
-                    filtered[k] = v
-                    continue
-                diff_dims = [i for i, (sd, td) in enumerate(zip(v.shape, tv.shape))
-                             if sd != td]
-                if v.dim() == tv.dim() and len(diff_dims) == 1:
-                    # Partial copy along the single differing dim. Handles both
-                    # the input-conv channel growth (dim 1, e.g. 2->N) and the
-                    # output-conv channel growth (dim 0, 1->2) introduced by the
-                    # variance head: the existing velocity weights land in
-                    # channel 0, the new variance channel stays freshly init'd.
-                    d = diff_dims[0]
-                    new_v = tv.clone()
-                    c = min(v.shape[d], tv.shape[d])
-                    slicer = tuple(slice(0, c) if i == d else slice(None)
-                                   for i in range(v.dim()))
-                    new_v[slicer] = v[slicer]
-                    filtered[k] = new_v
-                    partial.append((k, tuple(v.shape), tuple(tv.shape), c, d))
-                else:
-                    skipped.append((k, tuple(v.shape), tuple(tv.shape)))
+            # Copy whatever overlaps (see utils.relaxed_state_dict): exact
+            # matches verbatim, grown/shrunk tensors block-wise, so a narrower
+            # checkpoint (e.g. 128-256-512) warm-starts a wider model
+            # (256-256-512) with the new channels left at their init.
+            filtered, partial, skipped = relaxed_state_dict(
+                src_sd, target_module.state_dict())
             missing, unexpected = target_module.load_state_dict(filtered, strict=False)
             if global_rank == 0:
+                for k, sshape, tshape, dims in partial:
+                    where = ", ".join(f"{c} along dim {d}" for d, c in dims)
+                    print(f"  [{label}] partial copy {k}: ckpt {sshape} -> model {tshape}, copied {where}")
+                for k, sshape, tshape in skipped:
+                    print(f"  [{label}] skipped {k}: ckpt {sshape} vs model {tshape}")
                 if partial:
-                    for k, sshape, tshape, c, d in partial:
-                        print(f"  [{label}] partial copy {k}: ckpt {sshape} -> model {tshape}, copied {c} channels along dim {d}")
-                if skipped:
-                    for k, sshape, tshape in skipped:
-                        print(f"  [{label}] skipped {k}: ckpt {sshape} vs model {tshape}")
+                    print(f"  [{label}] {len(partial)} tensor(s) partially copied, "
+                          f"{len(filtered) - len(partial)} exact, {len(skipped)} skipped")
                 if missing:
                     print(f"  [{label}] missing keys: {len(missing)}")
                 if unexpected:
@@ -671,9 +708,21 @@ def train(local_rank, args):
             params=model.parameters(),
             lr=args.lr, weight_decay=0.01,
         )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.max_epochs, eta_min=1e-6,
+    # Per-step schedule: warmup then cosine to --lr_min over `total_steps`.
+    # Epochs are volume-pair passes (a few dozen steps), so an epoch-keyed
+    # cosine would compress or stretch with the sampler quota; steps do not.
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = args.max_steps or args.max_epochs * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, cosine_warmup_lambda(args.warmup_steps, total_steps,
+                                        min_ratio=args.lr_min / args.lr),
     )
+    global_step = 0
+    epoch = -1
+    if global_rank == 0:
+        print(f"LR schedule: warmup {args.warmup_steps} steps, cosine "
+              f"{args.lr:g} -> {args.lr_min:g} over {total_steps} steps "
+              f"({steps_per_epoch} steps/epoch)")
     scaler = GradScaler(enabled=False)
 
     best_score = 0.0
@@ -744,6 +793,8 @@ def train(local_rank, args):
             torch.nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
+            global_step += 1
 
             if epoch >= args.ema_start_epoch:
                 ema.update()
@@ -756,7 +807,9 @@ def train(local_rank, args):
                     "lr": optimizer.param_groups[0]["lr"],
                 })
 
-        scheduler.step()
+            if global_step >= total_steps:
+                break
+        budget_done = global_step >= total_steps
 
         if args.distributed:
             epoch_loss_tensor = torch.tensor(epoch_loss, device=device)
@@ -768,7 +821,7 @@ def train(local_rank, args):
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{args.max_epochs}, Training loss: {epoch_loss:.4f}")
 
-        if (epoch + 1) % args.val_interval == 0:
+        if (epoch + 1) % args.val_interval == 0 or budget_done:
             use_ema = (epoch >= args.ema_start_epoch)
             if use_ema:
                 ema.apply_shadow()
@@ -1006,19 +1059,14 @@ def train(local_rank, args):
                 combined = sum(per_tt) / len(per_tt) if per_tt else 0.0
                 if combined > best_score:
                     best_score = combined
-                    contrast_tag = "_".join(args.contrast)
-                    artifact_tag = "_".join(sorted(args.artifact)) if args.artifact else "all"
-                    checkpoint_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_best.pt"
+                    checkpoint_path = checkpoint_name(args, "best")
                     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-                    model_sd = model.module.state_dict() if args.distributed else model.state_dict()
-                    ckpt_obj = {"model": model_sd}
-                    if args.train_text_encoder:
-                        enc = text_conditioner.encoder
-                        ckpt_obj["text_encoder"] = (
-                            enc.module.state_dict() if args.distributed
-                            else enc.state_dict()
-                        )
-                    torch.save(ckpt_obj, checkpoint_path)
+                    torch.save(checkpoint_state(
+                        model,
+                        text_conditioner.encoder if args.train_text_encoder else None,
+                        extra={"epoch": epoch, "global_step": global_step,
+                               "channels": tuple(args.channels)}),
+                        checkpoint_path)
                     detail = ", ".join(f"{tt}={score[ckpt_s][tt]:.4f}"
                                        for tt in TARGET_TYPES if tt in score[ckpt_s])
                     print(f"Saved best model (cfg={ckpt_s:g}) combined "
@@ -1055,20 +1103,33 @@ def train(local_rank, args):
             if use_ema:
                 ema.restore()
 
+        if (global_rank == 0 and args.save_model and args.save_last_every > 0
+                and ((epoch + 1) % args.save_last_every == 0 or budget_done)):
+            # Raw (non-EMA) weights, the same thing --checkpoint_path warm-starts from.
+            last_path = checkpoint_name(args, "last")
+            os.makedirs(os.path.dirname(last_path), exist_ok=True)
+            torch.save(checkpoint_state(
+                model,
+                text_conditioner.encoder if args.train_text_encoder else None,
+                extra={"epoch": epoch, "global_step": global_step,
+                               "channels": tuple(args.channels)}),
+                last_path)
+            print(f"Saved last checkpoint at epoch {epoch + 1}, step {global_step}")
+
+        if budget_done:
+            if global_rank == 0:
+                print(f"Reached --max_steps ({total_steps}) at epoch {epoch + 1}; stopping.")
+            break
+
     if global_rank == 0 and args.save_model:
-        contrast_tag = "_".join(args.contrast)
-        artifact_tag = "_".join(sorted(args.artifact)) if args.artifact else "all"
-        final_path = f"./checkpoints_uncertainty/flow_matching_3d_{contrast_tag}_{artifact_tag}_final.pt"
+        final_path = checkpoint_name(args, "final")
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
-        model_sd = model.module.state_dict() if args.distributed else model.state_dict()
-        ckpt_obj = {"model": model_sd}
-        if args.train_text_encoder:
-            enc = text_conditioner.encoder
-            ckpt_obj["text_encoder"] = (
-                enc.module.state_dict() if args.distributed
-                else enc.state_dict()
-            )
-        torch.save(ckpt_obj, final_path)
+        torch.save(checkpoint_state(
+            model,
+            text_conditioner.encoder if args.train_text_encoder else None,
+            extra={"epoch": epoch, "global_step": global_step,
+                               "channels": tuple(args.channels)}),
+            final_path)
 
     if args.distributed:
         dist.barrier()
