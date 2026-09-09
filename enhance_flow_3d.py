@@ -1,16 +1,31 @@
 """3D NIfTI flow matching inference on un-patched whole volumes.
 
-Loads one .nii.gz, normalizes [0, 255] -> [0, 1], pads X/Y/Z to multiples of 16,
-slides 32-thick chunks along Z with full XY in one shot per chunk, runs flow
-matching, stitches along Z with overlap-and-add blending, unpads, and saves.
+Mirrors the training contract of dataset.py / train_flow.py:
+  * the input is normalized per volume exactly like training: its 0.5/99.5
+    intensity percentiles (`--norm_percentiles`) map to [0, 1], clipped;
+  * inference slides PATCH_Z=7-thick slabs (the training depth) along the
+    slab axis with full XY per slab, pads each slab to 8 slices inside the
+    UNet call (utils.pad_depth, as FlowMatcher._unet does in training) and
+    stitches along the slab axis with overlap-and-add blending;
+  * the cross-attention context is the *whole* training prompt,
+    "Input: <input phrase> <anatomy> MRI. Target: <target description>.", and
+    its orientation word is the plane of the array axis being slabbed, so
+    each `--planes` pass encodes its own prompt.
 
-The cross-attention context is the *target* text prompt -- it selects which
-output the multi-task model produces. Supply it directly with `--prompt` or via
-`--prompt_json` (a sidecar with a `prompt` key, matching the dataset's JSON
-sidecars). It is encoded by the frozen RadBERT text encoder, exactly as during
-training. Examples:
-    "Fully sampled axial 7T brain T2-weighted FLAIR MRI of resolution 0.85 x 0.75 x 1.5 mm."
-    "Denoised and biascorrected coronal 1.5T knee Proton Density MRI of resolution 0.44 x 0.44 x 3 mm."
+Prompt sources:
+  --auto_prompt   build it from the input's location, which must follow the
+                  training layout <root>/<anatomy>/<acq>/<subject>/<file>.nii.gz
+                  (dataset.prompt_for_path); `--target raw|md` picks the task.
+                  TSE inputs are restricted to their through-plane axis, as in
+                  training.
+  --prompt TEXT   verbatim; a `{plane}` slot or a literal sagittal/coronal/
+                  axial word is replaced per plane pass. Examples:
+    "Input: grappa undersampled brain MRI. Target: Fully sampled {plane} 7T brain T1-weighted MP2RAGE MRI of resolution 0.55 x 0.55 x 0.55 mm."
+    "Input: fully sampled brain MRI. Target: Denoised and biascorrected {plane} 3T brain T2-weighted FLAIR MRI of resolution 0.8 x 0.8 x 1.5 mm."
+
+Output intensities are in the normalized [0, 1] range by default; `--rescale`
+maps them back into the input's intensity units through the same percentile
+window, and `--hist` matches the input's histogram instead.
 
 Classifier-free guidance is enabled with `--guidance_scale > 1.0`. Each ODE
 step then runs two forwards: conditional + unconditional (encoded empty
@@ -27,37 +42,35 @@ velocity units, not the input's intensity units. Larger values mark voxels the
 model is least sure about -- useful for flagging hallucinated structure.
 
 Usage:
-    # artifact -> fully sampled (raw)
+    # held-out test file, artifact -> fully sampled, prompt from its path
     python enhance_flow_3d.py \
-        --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints_uncertainty/flow_matching_3d_brain_all_best_062926.pt \
-        --input_path /ix1/tibrahim/jil202/250507-promote_recovery_from_aws/data/PRT191518_2019.12.05/rT2w_FLAIR_lowres.nii.gz   \
+        --checkpoint_path checkpoints/flow_matching_3d_brain_best.pt \
+        --input_path /vast/tibrahim/jil202/nii_test/brain/mp2rage_ax_7T/sub12/sub12_UNI_DEN_R3.nii.gz \
+        --output_path ./outputs/sub12_R3.nii.gz \
+        --auto_prompt --target raw \
+        --num_sampling_steps 4 --euler --fp16 --non_overlap 3 --batch_size 8 \
+        --planes axial coronal sagittal --rescale --compile
+
+    # same file, artifact -> denoised + bias-corrected, with the uncertainty map
+    python enhance_flow_3d.py \
+        --checkpoint_path checkpoints_uncertainty/flow_matching_3d_brain_best.pt \
+        --input_path /vast/tibrahim/jil202/nii_test/brain/mp2rage_ax_7T/sub12/sub12_UNI_DEN_R3.nii.gz \
+        --output_path ./outputs/sub12_R3_md.nii.gz \
+        --auto_prompt --target md --save_uncertainty_map \
+        --num_sampling_steps 4 --euler --fp16 --non_overlap 3 --planes axial
+
+    # an arbitrary file outside the training layout: spell the prompt out
+    python enhance_flow_3d.py \
+        --checkpoint_path checkpoints/flow_matching_3d_brain_best.pt \
+        --input_path /some/where/rT2w_FLAIR_lowres.nii.gz \
         --output_path ./outputs/flair.nii.gz \
-        --prompt "Fully sampled sagittal 3T brain T2-weighted FLAIR MRI of resolution 0.7 x 0.5 x 0.5 mm." \
-        --num_sampling_steps 4 --euler --fp16 --non_overlap 8 \
-        --guidance_scale 1 --compile --planes sagittal --autocrop --ras
-
-    # same, also writing ./outputs/flair_uncertainty.nii.gz
-    python enhance_flow_3d.py \
-        --checkpoint_path /vast/tibrahim/jil202/autoflow/checkpoints_uncertainty/flow_matching_3d_brain_all_best_062926.pt \
-        --input_path /vast/tibrahim/jil202/autoflow/rT1w_BRAVO_lowres.nii.gz \
-        --output_path ./outputs/BRAVO.nii.gz \
-        --prompt "Fully sampled axial 3T brain T1-weighted BRAVO MRI of resolution 0.85 x 0.85 x 1.2 mm." \
-        --num_sampling_steps 4 --euler --fp16 --planes axial --non_overlap 8 --rescale \
-        --save_uncertainty_map
-
-    # raw (or artifact) -> denoised + bias-corrected, prompt read from a sidecar
-    python enhance_flow_3d.py \
-        --checkpoint_path checkpoints/flow_matching_3d_multitask.pt \
-        --input_path 3T.nii.gz \
-        --output_path ./outputs/3T_denoised.nii.gz \
-        --prompt_json /vast/tibrahim/jil202/data/test/brain/mprage_ax_3T/mde14089s3_P53248.7/mde14089s3_P53248.7.json \
-        --num_sampling_steps 1 --euler --fp16 --non_overlap 16 \
-        --guidance_scale 0 --rescale --compile --ras
+        --prompt "Input: anisotropic undersampled brain MRI. Target: Fully sampled {plane} 3T brain T2-weighted FLAIR MRI of resolution 0.7 x 0.5 x 0.5 mm." \
+        --num_sampling_steps 4 --euler --fp16 --non_overlap 3 --ras --autocrop --hist
 """
 
 import argparse
-import json
 import os
+import re
 
 import nibabel as nib
 import numpy as np
@@ -67,11 +80,17 @@ import torch.nn.functional as F
 from monai.networks.nets import DiffusionModelUNet
 from tqdm import tqdm
 
+from dataset import (DEFAULT_AXIS_PLANES, axis_planes as affine_axis_planes,
+                     normalize_volume, prompt_for_path, volume_window)
 from train_flow import TextConditioner
+from utils import crop_depth, pad_depth
 
 
-PATCH_Z = 16
-PAD_MULT = 16
+# Training patches are 96 x 96 x 7 (dataset.py); the UNet needs Z % 4 == 0, so
+# each slab is padded to 8 inside FlowMatcher._v exactly as in training.
+PATCH_Z = 7
+DEPTH_MULT = 4
+PAD_MULT = 16   # X/Y padding only; the slab axis is padded to >= PATCH_Z
 
 
 def to_ras(img):
@@ -113,6 +132,14 @@ class FlowMatcher(nn.Module):
     def _step_input(self, x, condition):
         return torch.cat([x, condition], dim=1)
 
+    def _unet(self, model_input, timesteps, context):
+        """UNet forward with the training-time depth padding: the slab axis
+        (last dim) is replicate-padded to a multiple of DEPTH_MULT (7 -> 8)
+        and the output cropped back, as train_flow.FlowMatcher._unet does."""
+        padded, z0 = pad_depth(model_input, DEPTH_MULT)
+        out = self.model(padded, timesteps, context=context)
+        return crop_depth(out, z0)
+
     @torch.no_grad()
     def _v(self, x, condition, t, context, null_context, guidance_scale,
            return_logvar=False):
@@ -131,13 +158,13 @@ class FlowMatcher(nn.Module):
         with torch.autocast(device_type=self.amp_device, dtype=torch.bfloat16,
                             enabled=self.amp_enabled):
             if guidance_scale != 1.0 and null_context is not None:
-                out_c = self.model(inp, timesteps, context=context)
-                out_u = self.model(inp, timesteps, context=null_context)
+                out_c = self._unet(inp, timesteps, context)
+                out_u = self._unet(inp, timesteps, null_context)
                 v_cond, v_uncond = out_c[:, 0:1], out_u[:, 0:1]
                 v = v_uncond + guidance_scale * (v_cond - v_uncond)
                 out_lv = out_u if guidance_scale == 0.0 else out_c
             else:
-                out_c = self.model(inp, timesteps, context=context)
+                out_c = self._unet(inp, timesteps, context)
                 v = out_c[:, 0:1]
                 out_lv = out_c
         # Back to fp32 so the Euler/Heun/RK4 accumulation stays full precision.
@@ -225,16 +252,31 @@ class FlowMatcher(nn.Module):
         return (x, var_accum.sqrt()) if return_uncertainty else x
 
 
-# Per-plane permutations that move the slab axis to the LAST dim of an
-# (X, Y, Z) volume, matching training-time slab shape (x, y, slab):
-#   axial    slab=Z -> (X, Y, Z)            identity
-#   coronal  slab=Y -> (X, Z, Y)            permute(0, 2, 1)
-#   sagittal slab=X -> (Y, Z, X)            permute(1, 2, 0)
-PLANE_PERMS = {
-    "axial":    ((0, 1, 2), (0, 1, 2)),
-    "coronal":  ((0, 2, 1), (0, 2, 1)),
-    "sagittal": ((1, 2, 0), (2, 0, 1)),
+# Per-axis permutations that move the slab (thin) array axis to the LAST dim,
+# matching the training loader's `np.moveaxis(crop, axis, -1)`:
+#   axis 2 -> (X, Y, Z)   identity
+#   axis 1 -> (X, Z, Y)   permute(0, 2, 1)
+#   axis 0 -> (Y, Z, X)   permute(1, 2, 0)
+# Which anatomical plane an axis is comes from the affine (dataset.axis_planes);
+# for RAS storage it is [sagittal, coronal, axial].
+AXIS_PERMS = {
+    2: ((0, 1, 2), (0, 1, 2)),
+    1: ((0, 2, 1), (0, 2, 1)),
+    0: ((1, 2, 0), (2, 0, 1)),
 }
+PLANE_PERMS = {p: AXIS_PERMS[i] for i, p in enumerate(DEFAULT_AXIS_PLANES)}
+
+_PLANE_WORD_RE = re.compile(r"\b(sagittal|coronal|axial)\b")
+
+
+def plane_prompt(template: str, plane: str) -> str:
+    """Fill the prompt's orientation word for one plane pass: a `{plane}`
+    slot (dataset.build_samples / prompt_for_path templates) or, for a
+    hand-written prompt, the first literal sagittal/coronal/axial word.
+    Prompts without either are returned unchanged."""
+    if "{plane}" in template:
+        return template.replace("{plane}", plane)
+    return _PLANE_WORD_RE.sub(plane, template, count=1)
 
 
 def make_blend_window(patch_z, non_overlap, dtype=torch.float32):
@@ -347,12 +389,17 @@ def slab_inference(padded, sampler, num_steps, device, ctx_emb, null_emb,
 
 def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
                         sampler, args, device,
-                        snapshot_idx=None, snapshot_path=None):
-    """Permute (X, Y, Z) volume so `plane`'s slab axis is last, run slab
+                        snapshot_idx=None, snapshot_path=None,
+                        axis_planes=None):
+    """Permute the (X, Y, Z) volume so `plane`'s slab axis is last, run slab
     inference, then permute back to (X, Y, Z).
 
-    `ctx_emb`/`null_emb` are shared across planes: training built the prompt
-    from the params JSON's voxel order regardless of patch orientation.
+    `axis_planes` names the plane of each array axis (dataset.axis_planes of
+    the volume's affine); default RAS order [sagittal, coronal, axial].
+
+    `ctx_emb`/`null_emb` must already be encoded for *this* plane: training
+    puts the plane word of the slabbed axis into each patch's prompt (see
+    `plane_prompt`).
 
     Returns `(output, uncertainty)`, both in (X, Y, Z); `uncertainty` is None
     unless `args.save_uncertainty_map`. `getattr` guards the flag because other
@@ -360,10 +407,12 @@ def run_plane_inference(vol_t, plane, ctx_emb, null_emb,
     with their own argparse namespaces, which do not define it.
     """
     want_unc = getattr(args, "save_uncertainty_map", False)
-    perm, inv_perm = PLANE_PERMS[plane]
+    axis = list(axis_planes or DEFAULT_AXIS_PLANES).index(plane)
+    perm, inv_perm = AXIS_PERMS[axis]
     permuted = vol_t.permute(*perm).contiguous()
 
-    padded, pad_info, original_shape = pad_to_multiple(permuted, PAD_MULT, min_z=PATCH_Z)
+    padded, pad_info, original_shape = pad_to_multiple(
+        permuted, PAD_MULT, min_z=PATCH_Z, z_mult=1)
     non_overlap = max(0, args.non_overlap)
     print(f"  [{plane}] permuted shape={tuple(permuted.shape)}, "
           f"padded shape={tuple(padded.shape)}")
@@ -446,6 +495,10 @@ def save_volume(volume_t, path, to_orig_ornt, rescale, ref_img,
     Order is: repad -> reorient -> hist-match (or rescale) -> save. Saved with
     `ref_img.affine`/`header` so the file on disk matches the input geometry.
 
+    `rescale` is falsy (keep the model's [0, 1] range) or the `(lo, hi)`
+    window `normalize_volume` mapped to [0, 1]; the output is then mapped back
+    to the input's intensity units, `arr * (hi - lo) + lo`, as float32.
+
     `hist_match_ref` (if given) overrides `rescale`: the output's intensity
     CDF is matched to the reference array's CDF and saved as float32.
 
@@ -463,7 +516,9 @@ def save_volume(volume_t, path, to_orig_ornt, rescale, ref_img,
     if hist_match_ref is not None:
         arr = match_histograms(arr, hist_match_ref)
     elif rescale:
-        arr = np.rint(np.clip(arr * 255.0, 0, 255)).astype(np.uint8)
+        lo, hi = rescale
+        arr = (np.asarray(arr, dtype=np.float32) * (hi - lo) + lo).astype(np.float32)
+        dtype = np.float32 if dtype is None else dtype
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     out_img = nib.Nifti1Image(arr, ref_img.affine, ref_img.header)
     if dtype is not None:
@@ -538,12 +593,14 @@ def parse_args():
                         "output into all-NaN/blank volumes.")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--rescale", action="store_true",
-                   help="Rescale output back to ~[0, 255] uint16 before save")
-    p.add_argument("--norm_div", type=float, default=None,
-                   help="Fixed divisor to normalize input into the model's "
-                        "expected range. Default (None) divides by the input's "
-                        "own max (whole-volume behavior). Set to 1.0 for "
-                        "pre-normalized patches to feed them through unchanged.")
+                   help="Map the output from the model's [0, 1] range back to "
+                        "the input's intensity units through the same "
+                        "percentile window used to normalize it (float32).")
+    p.add_argument("--norm_percentiles", type=float, nargs=2, default=(0.5, 99.5),
+                   metavar=("LO", "HI"),
+                   help="Per-volume intensity percentiles mapped to 0 and 1 "
+                        "before inference; must match training "
+                        "(dataset.normalize_volume, default 0.5 99.5).")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=42)
 
@@ -553,13 +610,17 @@ def parse_args():
     # auto-detected.
     g = p.add_mutually_exclusive_group(required=False)
     g.add_argument("--prompt", type=str, default=None,
-                   help="Target text prompt (the cross-attention context that "
-                        "selects the output), e.g. \"Fully sampled axial 7T "
-                        "brain T2-weighted FLAIR MRI of resolution 0.85 x 0.75 "
-                        "x 1.5 mm.\" or \"Denoised and biascorrected ...\".")
-    g.add_argument("--prompt_json", type=str, default=None,
-                   help="Sidecar JSON with a `prompt` key (the dataset's "
-                        "<subject>.json format) to read the target prompt from.")
+                   help="Full training-style prompt, \"Input: <input phrase> "
+                        "<anatomy> MRI. Target: <target description>.\" A "
+                        "`{plane}` slot (or a literal sagittal/coronal/axial "
+                        "word) is filled per --planes pass.")
+    g.add_argument("--auto_prompt", action="store_true",
+                   help="Build the prompt from the input's path, which must "
+                        "follow the training layout <root>/<anatomy>/<acq>/"
+                        "<subject>/<file>.nii.gz (dataset.prompt_for_path).")
+    p.add_argument("--target", type=str, default="raw", choices=["raw", "md"],
+                   help="With --auto_prompt: the output to ask for -- raw "
+                        "(fully sampled) or md (denoised + bias-corrected).")
 
     # Classifier-free guidance
     p.add_argument("--guidance_scale", type=float, default=1,
@@ -611,6 +672,21 @@ def parse_args():
     return p.parse_args()
 
 
+def infer_channels(state_dict):
+    """UNet channel widths per level, read off the checkpoint's weights: the
+    first resnet conv of `down_blocks.<i>` has `channels[i]` output channels.
+    Survives `module.` / `_orig_mod.` prefixes."""
+    widths = {}
+    for k, v in state_dict.items():
+        key = k.replace("module.", "").replace("_orig_mod.", "")
+        if key.startswith("down_blocks.") and key.endswith(".resnets.0.conv1.conv.weight"):
+            widths[int(key.split(".")[1])] = int(v.shape[0])
+    if not widths:
+        raise ValueError("cannot infer UNet channels: no down_blocks.*.resnets.0.conv1 "
+                         "weights in the checkpoint")
+    return tuple(widths[i] for i in range(len(widths)))
+
+
 def load_model(checkpoint_path, device, args):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if not (isinstance(ckpt, dict) and "model" in ckpt):
@@ -642,14 +718,18 @@ def load_model(checkpoint_path, device, args):
         print("  detected UA-Flow checkpoint (out_channels=2); using velocity "
               "mean channel for inference")
 
+    # Width comes from the checkpoint (train_flow.py --channels), so 128/256/512
+    # and wider models load through the same script.
+    channels = tuple(ckpt["channels"]) if "channels" in ckpt else infer_channels(ckpt["model"])
+    print(f"  UNet channels: {channels}")
     model = DiffusionModelUNet(
         spatial_dims=3,
         in_channels=2,
         out_channels=out_channels,
-        channels=(128, 256, 512),
+        channels=channels,
         attention_levels=(False, False, True),
         num_res_blocks=2,
-        num_head_channels=512,
+        num_head_channels=channels[-1],
         with_conditioning=has_cross,
         cross_attention_dim=cross_dim,
     )
@@ -687,21 +767,25 @@ def load_model(checkpoint_path, device, args):
     return model, text_conditioner, out_channels
 
 
-def pad_to_multiple(volume: torch.Tensor, mult: int, min_z: int = 0):
-    """Center-pad a 3D tensor (X, Y, Z) so each dim is a multiple of `mult`,
-    with the Z dim padded to at least `min_z` slices."""
-    def _amount(n, min_n=0):
+def pad_to_multiple(volume: torch.Tensor, mult: int, min_z: int = 0,
+                    z_mult: int = None):
+    """Center-pad a 3D tensor (X, Y, Z) so X and Y are multiples of `mult`
+    and Z is a multiple of `z_mult` (default `mult`) and at least `min_z`.
+    Slab inference only needs Z >= PATCH_Z (the last slab is re-anchored at
+    the end), so it passes `z_mult=1`."""
+    def _amount(n, m, min_n=0):
         target = max(n, min_n)
-        rem = target % mult
+        rem = target % m
         if rem != 0:
-            target += mult - rem
+            target += m - rem
         total = target - n
         l = total // 2
         return l, total - l
 
-    x_l, x_r = _amount(volume.shape[0])
-    y_l, y_r = _amount(volume.shape[1])
-    z_l, z_r = _amount(volume.shape[2], min_z)
+    z_mult = mult if z_mult is None else z_mult
+    x_l, x_r = _amount(volume.shape[0], mult)
+    y_l, y_r = _amount(volume.shape[1], mult)
+    z_l, z_r = _amount(volume.shape[2], z_mult, min_z)
     padded = F.pad(volume, (z_l, z_r, y_l, y_r, x_l, x_r), mode="constant", value=0.0)
     return padded, ((x_l, x_r), (y_l, y_r), (z_l, z_r)), volume.shape
 
@@ -713,16 +797,17 @@ def unpad(volume: torch.Tensor, pad_info, original_shape):
 
 
 def resolve_prompt(args):
-    """Return the target prompt from --prompt or the `prompt` key of --prompt_json."""
+    """`(prompt_template, meta)`: the prompt from --prompt (meta None) or,
+    with --auto_prompt, dataset.prompt_for_path's dict for the input file."""
     if args.prompt is not None:
-        return args.prompt
-    with open(args.prompt_json) as f:
-        meta = json.load(f)
-    if "prompt" not in meta:
-        raise ValueError(
-            f"--prompt_json {args.prompt_json} has no 'prompt' key."
-        )
-    return meta["prompt"]
+        return args.prompt, None
+    if args.auto_prompt:
+        meta = prompt_for_path(args.input_path, target=args.target)
+        return meta["prompt"], meta
+    raise ValueError(
+        "This is a text-conditioned checkpoint; supply --prompt or --auto_prompt "
+        "(the training-style prompt the model conditions on)."
+    )
 
 
 def main():
@@ -774,29 +859,40 @@ def main():
         raw = img.get_fdata().astype(np.float32)
     print(f"  raw shape={raw.shape}, range=[{raw.min():.2f}, {raw.max():.2f}]")
 
+    # Plane of each array axis, from the affine actually fed to the model
+    # (canonical RAS after --ras). Training named each patch's plane this way.
+    planes_of_axes = affine_axis_planes(img.affine)
+    print(f"  array axes -> planes: {planes_of_axes}")
+
     # Keep embeddings fp32; bf16 autocast (when --fp16) casts them inside the UNet.
     ctx_dtype = torch.float32
+    prompt_meta = None
     if text_conditioner is not None:
-        if args.prompt is None and args.prompt_json is None:
-            raise ValueError(
-                "This is a text-conditioned checkpoint; supply --prompt or "
-                "--prompt_json (the target description the model conditions on)."
-            )
-        prompt = resolve_prompt(args)
+        prompt_template, prompt_meta = resolve_prompt(args)
         print(f"  guidance_scale={args.guidance_scale}")
-        ctx_emb, null_emb = build_context_emb(
-            text_conditioner, prompt, device, ctx_dtype,
-        )
     else:
         # Unconditioned checkpoint: no text pathway. CFG is meaningless, so force
         # a single unconditional pass and ignore any supplied prompt.
-        if args.prompt is not None or args.prompt_json is not None:
+        if args.prompt is not None or args.auto_prompt:
             print("  note: unconditioned checkpoint; ignoring the supplied prompt.")
         if args.guidance_scale != 1.0:
             print(f"  note: unconditioned checkpoint; forcing guidance_scale=1.0 "
                   f"(was {args.guidance_scale}).")
             args.guidance_scale = 1.0
-        ctx_emb, null_emb = None, None
+        prompt_template = None
+
+    # TSE volumes were only ever slabbed along their through-plane axis.
+    # `thin_axes` index the file's *original* array axes, so resolve them to
+    # plane names with the original axis order (--ras may have permuted them).
+    if prompt_meta is not None and len(prompt_meta["thin_axes"]) < 3:
+        allowed = [prompt_meta["axis_planes"][a] for a in prompt_meta["thin_axes"]]
+        dropped = [p for p in args.planes if p not in allowed]
+        if dropped:
+            print(f"  note: {prompt_meta['acquisition']} is single-plane in "
+                  f"training; skipping {dropped}, keeping {allowed}")
+        args.planes = [p for p in args.planes if p in allowed]
+        if not args.planes:
+            raise ValueError(f"no requested plane is usable; use --planes {allowed}")
 
     non_overlap = max(0, args.non_overlap)
     if non_overlap >= PATCH_Z:
@@ -804,13 +900,13 @@ def main():
             f"--non_overlap must be in [0, {PATCH_Z - 1}]; got {non_overlap}"
         )
 
-    norm_div = args.norm_div if args.norm_div is not None else float(raw.max())
-    if norm_div <= 0:
-        raise ValueError(f"Normalization divisor must be > 0; got {norm_div}")
-    normalized = raw / norm_div
-    print(f"  norm_div={norm_div:.6f} "
-          f"({'fixed' if args.norm_div is not None else 'per-input max'})")
+    # Per-volume percentile normalization, identical to the training loader.
+    lo, hi = volume_window(raw, tuple(args.norm_percentiles))
+    normalized = normalize_volume(raw, tuple(args.norm_percentiles))
+    print(f"  normalized with percentiles {tuple(args.norm_percentiles)}: "
+          f"[{lo:.3f}, {hi:.3f}] -> [0, 1]")
     vol_t = torch.from_numpy(normalized)
+    rescale = (lo, hi) if args.rescale else None
 
     if args.rk4:
         sampler = flow.sample_rk4
@@ -847,11 +943,19 @@ def main():
                 snapshot_dir,
                 f"{output_basename}_{plane}_slab{args.snapshot_slab}.png",
             )
+        if prompt_template is not None:
+            ctx_emb, null_emb = build_context_emb(
+                text_conditioner, plane_prompt(prompt_template, plane),
+                device, ctx_dtype,
+            )
+        else:
+            ctx_emb, null_emb = None, None
         plane_out, plane_unc = run_plane_inference(
             vol_t, plane, ctx_emb, null_emb,
             sampler, args, device,
             snapshot_idx=snapshot_idx,
             snapshot_path=plane_snapshot_path,
+            axis_planes=planes_of_axes,
         )
         plane_outputs.append(plane_out)
         if plane_unc is not None:
@@ -874,14 +978,14 @@ def main():
     if len(plane_outputs) > 1:
         for plane, plane_out in zip(args.planes, plane_outputs):
             plane_path = f"{output_base}_{plane}{output_ext}"
-            save_volume(plane_out, plane_path, to_orig_ornt, args.rescale,
+            save_volume(plane_out, plane_path, to_orig_ornt, rescale,
                         orig_img, hist_match_ref=hist_ref,
                         repad_bounds=crop_bounds, pre_crop_shape=pre_crop_shape)
         for plane, plane_unc in zip(args.planes, plane_uncs):
             save_uncertainty(plane_unc, f"{output_base}_{plane}_uncertainty{output_ext}",
                              to_orig_ornt, orig_img, crop_bounds, pre_crop_shape)
 
-    save_volume(ensembled, args.output_path, to_orig_ornt, args.rescale,
+    save_volume(ensembled, args.output_path, to_orig_ornt, rescale,
                 orig_img, hist_match_ref=hist_ref,
                 repad_bounds=crop_bounds, pre_crop_shape=pre_crop_shape)
 
